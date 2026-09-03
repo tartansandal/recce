@@ -178,9 +178,17 @@ def _source_of(func: Func) -> Optional[str]:
     return '\n'.join(body) if body else None
 
 
+# The prompt decides what the model answers, so a cached note is only good for
+# the prompt that produced it. Keying on it means editing PROMPT invalidates the
+# cache by itself; without this a prompt change was invisible to the cache, and
+# `--no-cache` did not help — it never writes, so the stale entries survived on
+# disk for the next run without the flag to serve back.
+_PROMPT_DIGEST = hashlib.sha256(PROMPT.encode('utf-8')).hexdigest()[:8]
+
+
 def _key(model: str, source: str) -> str:
     digest = hashlib.sha256(source.encode('utf-8')).hexdigest()[:24]
-    return '{}:{}:{}'.format(model, MAX_NOTE_CHARS, digest)
+    return '{}:{}:{}:{}'.format(model, MAX_NOTE_CHARS, _PROMPT_DIGEST, digest)
 
 
 def why_rejected(raw: str, n_loops: Optional[int] = None) -> Optional[str]:

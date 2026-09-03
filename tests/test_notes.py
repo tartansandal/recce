@@ -7,6 +7,8 @@ degradation is a feature with a test, not an assumption.
 
 from __future__ import annotations
 
+import hashlib
+
 from recce import notes
 from recce.model import KEEP, SPINE, TRIVIAL, Func
 
@@ -160,3 +162,20 @@ def test_a_function_whose_file_has_gone_is_skipped_silently(tmp_path):
     func.path = str(tmp_path / 'vanished.py')
     report = notes.fill([func], model='m', host='http://127.0.0.1:9', use_cache=False)
     assert (report.asked, report.filled, report.error) == (0, 0, None)
+
+
+def test_the_cache_key_covers_the_prompt(monkeypatch):
+    """A note is only good for the prompt that produced it.
+
+    Editing PROMPT used to leave every entry looking valid, and `--no-cache`
+    did not clear them — it never writes, so the stale notes came back on the
+    next run without the flag.
+    """
+    assert (
+        notes._PROMPT_DIGEST
+        == hashlib.sha256(notes.PROMPT.encode('utf-8')).hexdigest()[:8]
+    )
+    source = 'def go():\n    pass\n'
+    before = notes._key('m', source)
+    monkeypatch.setattr(notes, '_PROMPT_DIGEST', 'deadbeef')
+    assert notes._key('m', source) != before

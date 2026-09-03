@@ -109,9 +109,12 @@ copies fit the budget. Ninety-nine passing tests never saw it.
   (3.9.6). `brew install ollama` pulls `python@3.14` as a dependency and it
   shadows the system one. Which interpreter runs recce decides what syntax it
   can read, so this matters more here than in most projects.
-- **Notes are cached** by content hash under `$XDG_CACHE_HOME/recce`, so a
-  rerun will not re-ask the model. Pass `--no-cache` when changing the prompt
-  or the model, or you will be measuring the last run.
+- **Notes are cached** under `$XDG_CACHE_HOME/recce`, so a rerun will not
+  re-ask the model. The key covers the model name, `MAX_NOTE_CHARS`, the
+  `PROMPT` text and the function source, so changing any of them invalidates
+  itself — you do not need `--no-cache` for that. What `--no-cache` does is
+  skip the cache in *both* directions: it never writes, so a run with it leaves
+  the previous entries on disk for the next run without it to serve back.
 - **`ruff format` runs before you patch by string match.** It rewrites slices
   like `chosen[: 1]` to `chosen[:1]`, which silently breaks a scripted
   `str.replace` against text you read earlier.
