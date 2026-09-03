@@ -99,6 +99,21 @@ Four passes, each reading only what the one before it wrote:
 trivial helper, what earns a star, and when a map splits, and those three
 choices are most of what separates this from a graph dump.
 
+Speed is not the point but it is worth knowing the shape, since it decides
+whether you can point this at something on a whim:
+
+| Target | Size | Time |
+|---|---|---|
+| a single module | 20-odd functions | instant |
+| `requests`, `httpx`, `flask` | 250-450 functions | under 0.1s |
+| `rich` | 100 modules, 844 functions | 0.2s |
+| the whole standard library | 1868 modules, 55,710 functions | 10s |
+
+Cost is nearly all parsing, so it scales with source read rather than with
+anything recce decides. Pointing it at a tree that large is a misuse — you get
+eight blocks and a note saying 1860 modules were not shown — but it will not
+fall over, and it says what it left out.
+
 ## Notes, from a local model
 
 Pass `--model` and recce will ask a local Ollama for the one thing `ast` cannot
