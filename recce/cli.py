@@ -77,7 +77,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--ollama-host',
         default=notes.DEFAULT_HOST,
-        help='where Ollama is listening (default: {})'.format(notes.DEFAULT_HOST),
+        help='where Ollama is listening, else $OLLAMA_HOST (default: {})'.format(
+            notes.DEFAULT_HOST
+        ),
     )
     parser.add_argument(
         '--no-cache',

@@ -194,6 +194,22 @@ as true as it was, which cutting mid-sentence would not. And a bland note is
 worse than no note, since it costs a line to say nothing, which is what the
 minimum length is defending against.
 
+## Environment
+
+Three variables, all optional:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `RECCE_MODEL` | unset | `auto` picks an installed model for every run; a model name pins that one. Same as `--model`, without the flag |
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | where to look for Ollama. `--ollama-host` overrides it |
+| `XDG_CACHE_HOME` | `~/.cache` | notes are remembered in `$XDG_CACHE_HOME/recce/notes.json`. Delete that file to forget them |
+
+`RECCE_MODEL` is the only one that turns anything on. The first two are read
+when `recce.notes` is imported, so exporting them mid-session affects the next
+run and not a running one; `XDG_CACHE_HOME` is read when a note is cached.
+With none of them set, and no `--model`, recce opens no socket and writes no
+files.
+
 ## Entry points
 
 recce looks for the way in, best evidence first: `[project.scripts]` in a
