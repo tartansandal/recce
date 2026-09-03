@@ -301,3 +301,64 @@ def test_the_cache_key_covers_the_shape_line():
     straight = notes._key('m', source, notes.shape_of(make(loops=0)))
     assert looped != straight
     assert notes._key('m', source, 'a') != notes._key('m', source, 'b')
+
+
+class TestNoteCharsIsAnArgumentNotAConstant:
+    """`--note-chars` has to reach every rule that reads the cap.
+
+    The cap is enforced in four places — the prompt asks for it, `_trim` cuts
+    to it, `why_rejected` measures against it, and `_key` files the answer
+    under it. A flag that moved only some of them would produce notes written
+    to one limit and judged by another.
+    """
+
+    def test_a_raised_cap_keeps_a_clause_the_default_would_drop(self):
+        long = (
+            'loops over funcs and modules, branches on module split then fit '
+            'budget, returns early or builds blocks by strategy'
+        )
+        assert len(notes.clean(long, 1)) <= notes.MAX_NOTE_CHARS
+        raised = notes.clean(long, 1, max_chars=140)
+        assert raised == long
+        assert 'builds blocks by strategy' in raised
+
+    def test_a_lowered_cap_rejects_what_the_default_accepts(self):
+        answer = 'loops over rows, buckets by status, totals the bytes'
+        assert notes.clean(answer, 1) == answer
+        assert notes.clean(answer, 1, max_chars=20) is None
+
+    def test_the_cap_is_part_of_what_a_cached_note_is_valid_for(self):
+        source = 'def go():\n    pass\n'
+        assert notes._key('m', source, '', 90) != notes._key('m', source, '', 140)
+
+    def test_the_prompt_asks_for_the_cap_it_will_be_judged_against(self):
+        sent = {}
+
+        class _Response:
+            def read(self):
+                return json.dumps({'response': 'loops over rows'}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            sent['body'] = json.loads(request.data.decode())
+            return _Response()
+
+        import urllib.request
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            notes._ask('http://h', 'm', 'def go(): pass', 5.0, '', max_chars=140)
+        finally:
+            urllib.request.urlopen = original
+        # `PROMPT` wraps between "Under" and the number, so match the number.
+        assert '140 characters' in sent['body']['prompt']
+        assert '90 characters' not in sent['body']['prompt']
+        # The reason the whole comparison was runnable at all: a thinking
+        # model spends num_predict on reasoning and returns an empty response.
+        assert sent['body']['think'] is False

@@ -70,6 +70,15 @@ _PREFERRED_MODELS = (
 
 # Past this the note stops being an annotation and becomes a paragraph
 # competing with the row it hangs under.
+#
+# It is the default rather than the law, because it is tuned to a 7B's terse
+# register and a stronger model writes denser. qwen3.8:27b answered `plan`
+# with 114 characters, of which `_trim` kept 70 and dropped "returns early or
+# builds blocks by strategy" — a clause the reader wanted. `--note-chars`
+# raises it. Everything below takes it as an argument rather than reading the
+# constant, so the cap travels with the question being asked; `_key` folds it
+# into the cache key, so changing it re-asks rather than serving answers
+# written to a different limit.
 MAX_NOTE_CHARS = 90
 
 # Trimming can leave a clause that is true and says nothing — `render` came
@@ -218,7 +227,9 @@ def _source_of(func: Func) -> Optional[str]:
     return '\n'.join(body) if body else None
 
 
-def _key(model: str, source: str, shape: str = '') -> str:
+def _key(
+    model: str, source: str, shape: str = '', max_chars: int = MAX_NOTE_CHARS
+) -> str:
     """What a cached note is valid for.
 
     `shape` is in here because it is part of the prompt but not part of
@@ -229,12 +240,15 @@ def _key(model: str, source: str, shape: str = '') -> str:
     """
     asked = hashlib.sha256((shape + '\x00' + source).encode('utf-8'))
     return '{}:{}:{}:{}'.format(
-        model, MAX_NOTE_CHARS, _PROMPT_DIGEST, asked.hexdigest()[:24]
+        model, max_chars, _PROMPT_DIGEST, asked.hexdigest()[:24]
     )
 
 
 def why_rejected(
-    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+    raw: str,
+    n_loops: Optional[int] = None,
+    n_branches: Optional[int] = None,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """Name the rule a response broke, or None if it passed.
 
@@ -242,10 +256,10 @@ def why_rejected(
     rejecting. Whether a 29% keep rate means the model is weak or the length
     cap is mean is not a thing to have an opinion about when it can be counted.
     """
-    text = _trim(_reduce(raw))
+    text = _trim(_reduce(raw), max_chars)
     if not text:
         return 'empty'
-    if len(text) > MAX_NOTE_CHARS:
+    if len(text) > max_chars:
         return 'too long'
     if len(text.split()) < 3 or len(text) < MIN_NOTE_CHARS:
         return 'too short'
@@ -272,7 +286,7 @@ def _reduce(raw: str) -> str:
     return ' '.join(text.split())
 
 
-def _trim(text: str) -> str:
+def _trim(text: str, max_chars: int = MAX_NOTE_CHARS) -> str:
     """Drop trailing clauses until the note fits, or give up on it.
 
     This is the one place truncation is allowed, and the distinction is worth
@@ -286,13 +300,13 @@ def _trim(text: str) -> str:
     rather than any fault in the answer, so refusing to trim was throwing away
     most of what the model got right.
     """
-    if len(text) <= MAX_NOTE_CHARS:
+    if len(text) <= max_chars:
         return text
     clauses = text.split(', ')
     kept: list = []
     for clause in clauses:
         candidate = ', '.join(kept + [clause])
-        if len(candidate) > MAX_NOTE_CHARS:
+        if len(candidate) > max_chars:
             break
         kept.append(clause)
     # A single clause over the cap is a run-on, not a list, and there is no
@@ -301,7 +315,10 @@ def _trim(text: str) -> str:
 
 
 def clean(
-    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+    raw: str,
+    n_loops: Optional[int] = None,
+    n_branches: Optional[int] = None,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """Reduce a model response to a usable note, or reject it.
 
@@ -321,9 +338,9 @@ def clean(
     there. A reader has no way to catch that from the map alone, which is
     exactly why the map must catch it for them.
     """
-    if why_rejected(raw, n_loops, n_branches) is not None:
+    if why_rejected(raw, n_loops, n_branches, max_chars) is not None:
         return None
-    text = _trim(_reduce(raw))
+    text = _trim(_reduce(raw), max_chars)
     return text[0].lower() + text[1:] if text[:1].isupper() else text
 
 
@@ -394,13 +411,18 @@ def shape_of(func: Func) -> str:
 
 
 def _ask(
-    host: str, model: str, source: str, timeout: float, shape: str = ''
+    host: str,
+    model: str,
+    source: str,
+    timeout: float,
+    shape: str = '',
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """One blocking call to Ollama's generate endpoint."""
     payload = json.dumps(
         {
             'model': model,
-            'prompt': PROMPT.format(source=source, limit=MAX_NOTE_CHARS, shape=shape),
+            'prompt': PROMPT.format(source=source, limit=max_chars, shape=shape),
             'stream': False,
             # Every Qwen from 3.6 on thinks by default, and the reasoning goes
             # in front of the answer. `num_predict` below is 60 tokens, so the
@@ -441,6 +463,7 @@ def fill(
     limit: int = DEFAULT_LIMIT,
     timeout: float = 60.0,
     use_cache: bool = True,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Report:
     """Write a note onto the functions worth one. Never raises."""
     report = Report()
@@ -463,13 +486,13 @@ def fill(
             continue
         report.asked += 1
         shape = shape_of(func)
-        key = _key(model, source, shape)
+        key = _key(model, source, shape, max_chars)
         if use_cache and key in cache:
             func.note = cache[key]
             report.cached += 1
             continue
         try:
-            raw = _ask(host, model, source, timeout, shape)
+            raw = _ask(host, model, source, timeout, shape, max_chars)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             # One failure means the server is gone or the model is not pulled.
             # Both make every remaining call fail the same way, so stop rather
@@ -477,13 +500,21 @@ def fill(
             report.error = str(getattr(exc, 'reason', None) or exc)
             break
         reason = why_rejected(
-            raw or '', n_loops=func.n_loops, n_branches=func.n_branches
+            raw or '',
+            n_loops=func.n_loops,
+            n_branches=func.n_branches,
+            max_chars=max_chars,
         )
         if reason is not None:
             report.rejected += 1
             report.reasons[reason] = report.reasons.get(reason, 0) + 1
             continue
-        note = clean(raw or '', n_loops=func.n_loops, n_branches=func.n_branches)
+        note = clean(
+            raw or '',
+            n_loops=func.n_loops,
+            n_branches=func.n_branches,
+            max_chars=max_chars,
+        )
         func.note = note
         report.filled += 1
         if use_cache:
