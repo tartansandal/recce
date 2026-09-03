@@ -138,6 +138,12 @@ def _walk(
         rows.append((prefix + connector + _row_text(node), node.bracket))
         child_prefix = prefix + ('    ' if is_last else '│   ')
 
+    # The note hangs at the children's indent with no connector of its own.
+    # Rows are `name(args)` and notes are lowercase prose, so the two do not
+    # read as the same kind of thing even sitting at the same depth.
+    if node.note:
+        rows.append((child_prefix + node.note, None))
+
     for index, child in enumerate(node.children):
         _walk(child, child_prefix, index == len(node.children) - 1, rows)
 

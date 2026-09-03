@@ -18,10 +18,10 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from . import __version__
+from . import __version__, notes
 from .extract import discover
 from .graph import resolve
-from .rank import plan
+from .rank import annotate, plan
 from .render import render
 
 
@@ -55,9 +55,33 @@ def build_parser() -> argparse.ArgumentParser:
         '--stats', action='store_true', help='print a one-line summary to stderr'
     )
     parser.add_argument(
+        '--model',
+        default=None,
+        metavar='NAME',
+        help='Ollama model to write branch-shape notes with (e.g. qwen2.5-coder:7b)',
+    )
+    parser.add_argument(
+        '--notes-limit',
+        type=int,
+        default=notes.DEFAULT_LIMIT,
+        help='how many functions to ask about (default: {})'.format(
+            notes.DEFAULT_LIMIT
+        ),
+    )
+    parser.add_argument(
+        '--ollama-host',
+        default=notes.DEFAULT_HOST,
+        help='where Ollama is listening (default: {})'.format(notes.DEFAULT_HOST),
+    )
+    parser.add_argument(
+        '--no-cache',
+        action='store_true',
+        help='ask the model again rather than reusing remembered notes',
+    )
+    parser.add_argument(
         '--no-llm',
         action='store_true',
-        help='accepted for forward compatibility; the static pass is the only mode',
+        help='never call a model, whatever --model says; the default already does not',
     )
     parser.add_argument('--version', action='version', version=__version__)
     return parser
@@ -80,6 +104,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     graph = resolve(project)
+
+    # Notes are written before planning, not after, because a note is a line
+    # and the budget counts lines. Annotating twice is cheap and idempotent:
+    # `plan` re-runs it to get roles and scores, and leaves `note` alone.
+    report = None
+    if args.model and not args.no_llm:
+        annotate(project, graph)
+        report = notes.fill(
+            project.funcs(),
+            model=args.model,
+            host=args.ollama_host,
+            limit=args.notes_limit,
+            use_cache=not args.no_cache,
+        )
+        if report.error:
+            print('recce: {}'.format(report.summary()), file=sys.stderr)
+
     mapping = plan(project, graph, max_lines=args.max_lines)
 
     base = str(args.base) if args.base else project.root
@@ -101,6 +142,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
     if args.stats:
+        if report is not None:
+            print('recce: {}'.format(report.summary()), file=sys.stderr)
         print(
             'recce: {} modules, {} functions, {} blocks, strategy={}'.format(
                 len(project.modules),
@@ -145,6 +188,7 @@ def _as_json(project, mapping) -> dict:
                         'doc': f.doc,
                         'n_stmts': f.n_stmts,
                         'n_branches': f.n_branches,
+                        'n_loops': f.n_loops,
                         'loc': f.loc,
                         'fan_in': f.fan_in,
                         'depth': f.depth,

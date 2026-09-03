@@ -79,6 +79,7 @@ class Func:
     calls: List[Call] = field(default_factory=list)
     n_stmts: int = 0
     n_branches: int = 0
+    n_loops: int = 0
     n_strings: int = 0
     loc: int = 0
     cls: Optional[str] = None

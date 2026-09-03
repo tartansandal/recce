@@ -71,6 +71,10 @@ _BRANCH_NODES = (
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
+# Loops are counted apart from branches because a note that claims one can be
+# checked against this. A comprehension counts: it is a loop the reader sees.
+_LOOP_NODES = (ast.For, ast.AsyncFor, ast.While, ast.comprehension)
+
 # Typing containers whose bracket form says the same thing in fewer characters.
 _CONTAINER_SHORTHAND = {
     'List': '[{}]',
@@ -214,6 +218,7 @@ def _body_metrics(
     """
     n_stmts = 0
     n_branches = 0
+    n_loops = 0
     n_strings = 0
     returns_keys: List[str] = []
     calls: List[Call] = []
@@ -223,6 +228,8 @@ def _body_metrics(
                 n_stmts += 1
             if isinstance(node, _BRANCH_NODES):
                 n_branches += 1
+            if isinstance(node, _LOOP_NODES):
+                n_loops += 1
             if _is_prose_string(node):
                 n_strings += 1
             if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
@@ -244,7 +251,7 @@ def _body_metrics(
     # than source order. The map reads top to bottom the way the function does,
     # which means the line number is what orders the children.
     calls.sort(key=lambda c: c.lineno)
-    return n_stmts, n_branches, calls, returns_keys, n_strings
+    return n_stmts, n_branches, n_loops, calls, returns_keys, n_strings
 
 
 def _is_prose_string(node: ast.AST) -> bool:
@@ -283,7 +290,7 @@ def _arg_names(node: ast.AST) -> List[str]:
 
 
 def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Func:
-    n_stmts, n_branches, calls, returns_keys, n_strings = _body_metrics(
+    n_stmts, n_branches, n_loops, calls, returns_keys, n_strings = _body_metrics(
         node.body  # type: ignore[attr-defined]
     )
     doc = ast.get_docstring(node)  # type: ignore[arg-type]
@@ -306,6 +313,7 @@ def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Fun
         calls=calls,
         n_stmts=max(n_stmts, 0),
         n_branches=n_branches,
+        n_loops=n_loops,
         n_strings=max(n_strings, 0),
         returns_keys=returns_keys,
         loc=max(end - node.lineno + 1, 1),  # type: ignore[attr-defined]
@@ -550,7 +558,7 @@ def extract_module(
                         )
                     )
         elif isinstance(node, ast.If) and _is_main_guard(node):
-            calls = _body_metrics(node.body)[2]
+            calls = _body_metrics(node.body)[3]
             module.main_calls = calls
 
     return module

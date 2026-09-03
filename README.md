@@ -93,18 +93,66 @@ Four passes, each reading only what the one before it wrote:
 trivial helper, what earns a star, and when a map splits, and those three
 choices are most of what separates this from a graph dump.
 
-## Where a local model would go
+## Notes, from a local model
 
-The static pass deliberately leaves one thing blank: `Func.note`, the one-line
-paraphrase of a function's loop and branch shape that the `code-map` skill
-writes by hand. That is the piece a model has to do, and `--json` exists to
-hand it over — read the functions, fill in the notes, hand it back.
+Pass `--model` and recce will ask a local Ollama for the one thing `ast` cannot
+tell it: what a function's loops and branches actually do.
 
-Scoping it that narrowly is the point. A model asked for one line about one
-function body, with no formatting rules to obey and no graph to hold in its
-head, is a job a small local model does acceptably; the same model asked to
-produce this whole document from the source will reproduce every anti-pattern
-the filtering exists to prevent.
+```sh
+ollama pull qwen2.5-coder:7b
+recce pkg/ --model qwen2.5-coder:7b
+```
+
+```
+main(argv)  ★
+ loops over lines, filters valid parsed lines, summarizes, prints
+ ├─ summarize(records)  ★
+ │   loops over records, accumulates counts and bytes by status and route
+```
+
+It is off by default and it fails soft. No Ollama, a timeout, a model that is
+not pulled — all of them leave the notes empty and the map renders exactly as
+it does without one.
+
+The model is shown one function body and asked for one line. It never sees the
+tree, the markers, the budget, or the markdown, so there is no convention for
+it to break and no global reasoning for it to get wrong. That narrowing is why
+a 7B is a plausible tool here and would not be if it were writing the document.
+
+### The static pass fact-checks the model
+
+This is the part worth stealing if you build something similar. recce already
+knows, from the syntax tree, whether a function contains a loop. So a note
+claiming one where none exists is not a judgement call — it is a statement the
+parser has already falsified, and it is dropped.
+
+That check is not hypothetical. Asked about a function whose entire body is a
+regex match and an early return, `qwen2.5-coder:7b` answered *"loops over
+characters in line, branches on match"*: fluent, specific, and describing code
+that is not there. A reader cannot catch that from the map, so the map catches
+it for them.
+
+Notes are also capped in length rather than asked to be short, cached by
+content hash so reruns are free and maps are stable, and counted against the
+line budget like any other row.
+
+### How good is it, actually
+
+Measured on recce's own source, 14 functions asked: 13 notes kept, 1 refused
+for inventing a loop. Reading those 13 against the code, nine were accurate and
+useful, two described recursion or dispatch as looping — weak, not false — and
+one was true but said nothing.
+
+The failure mode to watch is not wrongness, it is sameness: the model latches
+onto whatever shape the prompt's examples have and writes every note to that
+template. Vary the examples if the notes start reading alike.
+
+Two things worth knowing before trusting the numbers. Trimming is what made
+them: ten of eleven early rejections were length, not quality, so notes are now
+cut at clause boundaries — dropping whole clauses keeps every survivor exactly
+as true as it was, which cutting mid-sentence would not. And a bland note is
+worse than no note, since it costs a line to say nothing, which is what the
+minimum length is defending against.
 
 ## Tests
 
