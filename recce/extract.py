@@ -77,19 +77,6 @@ _BRANCH_NODES = (
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
-# `@overload` declares a signature; it does not define a function. requests
-# writes three `HTTPBasicAuth.__init__`s — two overloads and the real one —
-# and emitting a row for each says the class has three constructors. Stubs are
-# extracted and then lose to the implementation in `_dedupe_definitions`,
-# rather than being skipped outright: a name that has nothing but stubs is
-# still a name, and skipping it emptied whole modules out of the map.
-_OVERLOAD_DECORATORS = frozenset({'overload'})
-
-# The other half of a `@property` pair. A setter and a deleter share the
-# getter's name, and the getter is the definition that says what the attribute
-# is, so it wins however short its body.
-_MUTATOR_DECORATORS = frozenset({'setter', 'deleter'})
-
 # Loops are counted apart from branches because a note that claims one can be
 # checked against this. A comprehension counts: it is a loop the reader sees.
 _LOOP_NODES = (ast.For, ast.AsyncFor, ast.While, ast.comprehension)
@@ -372,8 +359,33 @@ def _arg_names(node: ast.AST) -> List[str]:
     return [n for n in names if n not in ('self', 'cls')]
 
 
-def _definition_rank(func: Func) -> Tuple[int, int, int]:
-    """Higher wins, in the two ways one name comes to be defined twice.
+# `@overload` declares a signature; it does not define a function. requests
+# writes three `HTTPBasicAuth.__init__`s — two overloads and the real one —
+# and emitting a row for each says the class has three constructors. Stubs are
+# extracted and then lose to the implementation below, rather than being
+# skipped outright: a name that has nothing but stubs is still a name, and
+# skipping it emptied whole modules out of the map.
+_OVERLOAD_DECORATORS = frozenset({'overload'})
+
+# The other half of a `@property` pair. A setter and a deleter share the
+# getter's name, and the getter is the definition that says what the attribute
+# is, so it wins however short its body.
+_MUTATOR_DECORATORS = frozenset({'setter', 'deleter'})
+
+
+class _DefinitionRank(NamedTuple):
+    """How much a definition deserves the single row its name gets.
+
+    Compared as a tuple, so the fields are in priority order and higher wins.
+    """
+
+    implementation: int  # 0 for an `@overload` stub, 1 for a real body
+    getter: int  # 0 for a `@property` setter or deleter, 1 for anything else
+    n_stmts: int
+
+
+def _definition_rank(func: Func) -> _DefinitionRank:
+    """Rank one definition of a name against another of the same name.
 
     An implementation beats its `@overload` stubs, and a `@property` getter
     beats its setter at any size. Only when neither applies does body size
@@ -382,7 +394,7 @@ def _definition_rank(func: Func) -> Tuple[int, int, int]:
     tails = func.decorator_tails
     stub = any(t in _OVERLOAD_DECORATORS for t in tails)
     mutator = any(t in _MUTATOR_DECORATORS for t in tails)
-    return (0 if stub else 1, 0 if mutator else 1, func.n_stmts)
+    return _DefinitionRank(0 if stub else 1, 0 if mutator else 1, func.n_stmts)
 
 
 def _merge_calls(winner: Func, loser: Func) -> None:
