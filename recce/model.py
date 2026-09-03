@@ -15,7 +15,8 @@ function's loop and branch shape goes when a model is in the loop.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from types import MappingProxyType
+from typing import Dict, List, Mapping, Optional, Tuple
 
 # How a call site was resolved. 'project' means we found the callee among the
 # modules we parsed and can draw an edge to it; 'external' means it belongs to
@@ -104,7 +105,6 @@ class Func:
     def is_method(self) -> bool:
         return self.cls is not None
 
-
     @property
     def decorator_tails(self) -> List[str]:
         """The last segment of each decorator name.
@@ -114,6 +114,7 @@ class Func:
         chose to import it.
         """
         return [d.split('.')[-1] for d in self.decorators]
+
 
 @dataclass
 class Class:
@@ -187,18 +188,32 @@ class Project:
     # nine million insertions to answer questions the first one had answered.
     #
     # `len(self.modules)` is the guard rather than a full signature: it is O(1),
-    # and adding a module is the only mutation that can invalidate the index.
+    # and discovery only ever adds. That buys a narrow contract — `modules` is
+    # append-only once the index has been built. Replacing a module under a
+    # name it already has, or deleting one and adding another, keeps the length
+    # and so hands back a stale index; nothing in recce does either, and a
+    # caller that starts to needs a real signature here rather than a count.
     # Functions are attached to a module when it is extracted and not after,
     # and the scoring passes mutate `Func` objects in place, which changes what
     # the index points at but never its keys.
-    _index: Optional[Dict[str, Func]] = field(default=None, repr=False, compare=False)
+    #
+    # It is handed out as a read-only view rather than copied. Every caller
+    # holds the one dict — `_Resolver` keeps it for the length of a resolve —
+    # so a caller who wrote to it would be writing into the cache every later
+    # pass reads. The proxy costs nothing and makes that a `TypeError` instead
+    # of a silent corruption; a caller who wants a mutable one says `dict(...)`.
+    _index: Optional[Mapping[str, Func]] = field(
+        default=None, repr=False, compare=False
+    )
     _index_size: int = field(default=-1, repr=False, compare=False)
 
     def funcs(self) -> List[Func]:
         return list(self.by_id().values())
 
-    def by_id(self) -> Dict[str, Func]:
+    def by_id(self) -> Mapping[str, Func]:
         if self._index is None or self._index_size != len(self.modules):
-            self._index = {f.node_id: f for m in self.modules.values() for f in m.funcs}
+            self._index = MappingProxyType(
+                {f.node_id: f for m in self.modules.values() for f in m.funcs}
+            )
             self._index_size = len(self.modules)
         return self._index

@@ -220,6 +220,15 @@ def test_the_function_index_is_built_once_and_reused(build):
     assert project.by_id() is first
 
 
+def test_the_function_index_cannot_be_written_through(build):
+    """Callers hold the one dict, so a write would land in the cache itself."""
+    import pytest
+
+    project, _, _, _ = build({'a.py': '"""P."""\n\n\ndef go():\n    pass\n'}, 'a.py')
+    with pytest.raises(TypeError):
+        project.by_id()['a::injected'] = project.by_id()['a::go']
+
+
 def test_the_index_notices_a_module_arriving_late(build):
     """The guard is O(1), so it has to catch the one mutation that matters."""
     from pathlib import Path
