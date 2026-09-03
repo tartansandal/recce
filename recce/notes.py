@@ -218,9 +218,19 @@ def _source_of(func: Func) -> Optional[str]:
     return '\n'.join(body) if body else None
 
 
-def _key(model: str, source: str) -> str:
-    source_digest = hashlib.sha256(source.encode('utf-8')).hexdigest()[:24]
-    return '{}:{}:{}:{}'.format(model, MAX_NOTE_CHARS, _PROMPT_DIGEST, source_digest)
+def _key(model: str, source: str, shape: str = '') -> str:
+    """What a cached note is valid for.
+
+    `shape` is in here because it is part of the prompt but not part of
+    `PROMPT`: `_PROMPT_DIGEST` covers the template, and the shape line is
+    injected into it per function. Editing `shape_of` therefore changes the
+    question while leaving the template alone, and without this the next run
+    answers from the old one.
+    """
+    asked = hashlib.sha256((shape + '\x00' + source).encode('utf-8'))
+    return '{}:{}:{}:{}'.format(
+        model, MAX_NOTE_CHARS, _PROMPT_DIGEST, asked.hexdigest()[:24]
+    )
 
 
 def why_rejected(
@@ -368,14 +378,18 @@ def shape_of(func: Func) -> str:
     """
     if func.n_loops:
         return (
-            'This function contains {} loop(s) and {} branch(es). '
-            'Say what it loops over.'.format(func.n_loops, func.n_branches)
+            'This function contains {} loop(s). Say what it loops over, and '
+            'name the condition that ends it or returns early if there is '
+            'one. Never write "various", "several", "multiple", "different" '
+            'or "appropriate".'.format(func.n_loops)
         )
     return (
         'This function contains NO loops. Do not write "loop", "loops", '
-        '"iterate" or "for each" — there is nothing to iterate. It has {} '
-        'branch(es); describe what they decide, or say what it dispatches '
-        'on, or what makes it return early.'.format(func.n_branches)
+        '"iterate" or "for each" — there is nothing to iterate. Name the '
+        'condition it decides on and what each way leads to, or what makes '
+        'it return early. Name the actual test, not how many there are: '
+        'never write "various", "several", "multiple", "different" or '
+        '"appropriate".'
     )
 
 
@@ -437,13 +451,14 @@ def fill(
         if source is None:
             continue
         report.asked += 1
-        key = _key(model, source)
+        shape = shape_of(func)
+        key = _key(model, source, shape)
         if use_cache and key in cache:
             func.note = cache[key]
             report.cached += 1
             continue
         try:
-            raw = _ask(host, model, source, timeout, shape_of(func))
+            raw = _ask(host, model, source, timeout, shape)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             # One failure means the server is gone or the model is not pulled.
             # Both make every remaining call fail the same way, so stop rather

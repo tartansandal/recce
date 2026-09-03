@@ -276,9 +276,28 @@ def test_a_branch_claim_survives_when_the_function_branches():
 
 
 def test_the_shape_line_forbids_loops_only_when_there_are_none():
-    straight = make(loops=0, branches=6)
-    looping = make(loops=2, branches=4)
-    assert 'NO loops' in notes.shape_of(straight)
-    assert '6 branch' in notes.shape_of(straight)
-    assert 'NO loops' not in notes.shape_of(looping)
-    assert '2 loop' in notes.shape_of(looping)
+    """The counts are there to forbid a claim, not to be counted back at us."""
+    straight = notes.shape_of(make(loops=0, branches=6))
+    looping = notes.shape_of(make(loops=2, branches=4))
+    assert 'NO loops' in straight
+    assert 'NO loops' not in looping
+    assert '2 loop' in looping
+    # Both halves ask for the deciding condition and ban the vague stand-ins
+    # the model reaches for when it has not found one.
+    for line in (straight, looping):
+        assert 'condition' in line
+        assert 'various' in line
+
+
+def test_the_cache_key_covers_the_shape_line():
+    """The shape line is part of the prompt but not part of PROMPT.
+
+    `_PROMPT_DIGEST` covers the template; the shape is injected into it per
+    function, so editing `shape_of` changes the question asked while leaving
+    the template alone. Without this the next run answers from the old one.
+    """
+    source = 'def go():\n    pass\n'
+    looped = notes._key('m', source, notes.shape_of(make(loops=2)))
+    straight = notes._key('m', source, notes.shape_of(make(loops=0)))
+    assert looped != straight
+    assert notes._key('m', source, 'a') != notes._key('m', source, 'b')
