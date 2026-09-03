@@ -171,3 +171,36 @@ def test_no_block_exceeds_the_line_budget(build):
     _, _, mapping, text = build(files, 'pkg', max_lines=40)
     for block in mapping.blocks:
         assert block.line_count() <= 40, block.title
+
+
+def test_a_multi_module_map_never_borrows_one_modules_docstring(build):
+    """Provenance holds even when two modules share one unsplit block.
+
+    Below the split threshold a package renders as a single tree with no
+    per-module headings, and the whole map's purpose can then only come from a
+    README. Taking whichever module the walk happened to reach first would
+    caption the package with one file's docstring, and the reader has no way
+    to see that is what happened.
+    """
+    _, _, mapping, text = build(
+        {
+            'a.py': '"""Parse a single log line."""\n\n\ndef alpha(x):\n    for i in range(x):\n        x += i\n    return x\n',
+            'b.py': 'def beta(rs):\n    return len(rs)\n',
+        },
+        '.',
+    )
+    assert mapping.strategy == 'single'
+    assert 'Parse a single log line' not in text
+
+
+def test_a_readme_beside_a_package_is_a_valid_purpose(build):
+    """The other half of the same rule: a directory's own README does count."""
+    _, _, _, text = build(
+        {
+            'README.md': 'Tools for chewing through webserver logs.\n',
+            'a.py': 'def alpha(x):\n    for i in range(x):\n        x += i\n    return x\n',
+            'b.py': 'def beta(rs):\n    return len(rs)\n',
+        },
+        '.',
+    )
+    assert 'Tools for chewing through webserver logs' in text.splitlines()[0]

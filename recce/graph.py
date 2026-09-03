@@ -140,7 +140,7 @@ def resolve(project: Project) -> Graph:
                         seen_targets.add(call.target)
                         targets.append(call.target)
                 elif call.kind == EXTERNAL and call.label:
-                    display = _external_display(call)
+                    display = external_display(call)
                     if display not in seen_externals:
                         seen_externals.add(display)
                         externals.append((display, call.label))
@@ -162,12 +162,17 @@ def resolve(project: Project) -> Graph:
     return graph
 
 
-def _external_display(call: Call) -> str:
-    """How an external call is written in the tree.
+def external_display(call: Call) -> str:
+    """How an external call is written, wherever it is written.
 
     The last two components carry the meaning — `AudioSegment.export` says more
     than `export` and less than the full dotted path, which would repeat the
     bracket label sitting at the end of the same row.
+
+    This is the single owner of that rule. The renderer shows the same call in
+    two places — as a tree row, and folded onto a collapsed helper row — and
+    when each had its own copy of the `parts[-2:]` slice they were one edit
+    away from disagreeing about what the same call is called.
     """
     parts = call.dotted.split('.')
     return '.'.join(parts[-2:]) if len(parts) > 1 else call.dotted

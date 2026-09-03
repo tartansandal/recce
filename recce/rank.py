@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .graph import Graph
+from .graph import Graph, external_display
 from .model import EXTERNAL, KEEP, PROJECT, SKIM, SPINE, TRIVIAL, Func, Project
 
 # Decorators that mean "a framework calls this", so the function is a way in
@@ -414,7 +414,7 @@ def _build_tree(
                 if not any(c.label == label for c in node.children):
                     node.children.append(Node(label=label))
             elif call.kind == EXTERNAL and call.label and depth < external_depth:
-                display = _external_row(call)
+                display = '{}()'.format(external_display(call))
                 if not any(c.label == display and c.bracket for c in node.children):
                     node.children.append(Node(label=display, bracket=call.label))
 
@@ -428,11 +428,6 @@ def _build_tree(
         return node
 
     return expand(root, 0, set())
-
-
-def _external_row(call) -> str:
-    parts = call.dotted.split('.')
-    return '{}()'.format('.'.join(parts[-2:]) if len(parts) > 1 else call.dotted)
 
 
 def _marker_for(func: Func) -> str:
@@ -535,14 +530,13 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
 
     nodes = _fit(roots, project, graph, max_lines)
     if sum(n.line_count() for n in nodes) <= max_lines:
-        module = next(iter(project.modules.values()))
-        result.blocks = [
-            Block(
-                title=_single_title(project),
-                purpose=_purpose_of(module, project),
-                roots=nodes,
-            )
-        ]
+        # A single-block map has no `##` heading, so this block's title and
+        # purpose are never rendered — `render._heading` owns the document
+        # heading and is the only thing that applies the purpose-provenance
+        # rule. Filling them in here meant picking an arbitrary module out of
+        # a dict and calling its docstring the whole map's purpose, which was
+        # invisible only because nothing read it back.
+        result.blocks = [Block(title='', purpose=None, roots=nodes)]
         return result
 
     result.strategy = 'module' if len(project.modules) > 1 else 'entry'
@@ -580,22 +574,6 @@ def _roots_for(entries: Sequence[Func], project: Project, graph: Graph) -> List[
     return [max(funcs, key=lambda f: f.score)]
 
 
-def _single_title(project: Project) -> str:
-    module = next(iter(project.modules.values()))
-    return module.path.rsplit('/', 1)[-1] if len(project.modules) == 1 else module.name
-
-
-def _purpose_of(module, project: Project) -> Optional[str]:
-    """The purpose line, from the only three sources that are allowed to give one.
-
-    Module docstring, then package README, then a top-of-file comment block. If
-    none of the three exist there is no purpose line, and inferring one from
-    the function names would be exactly the guess the reader came here to
-    avoid making themselves.
-    """
-    return module.doc or project.readme or module.header_comment
-
-
 def _module_blocks(
     project: Project, graph: Graph, max_lines: int, max_blocks: int = 8
 ) -> List[Block]:
@@ -610,7 +588,6 @@ def _module_blocks(
     knows they are seeing eight modules of thirty can go and ask for the rest.
     """
     blocks: List[Block] = []
-    emitted: Set[str] = set()
     for name in _select_modules(project, max_blocks):
         module = project.modules[name]
         if not module.funcs:
@@ -618,8 +595,11 @@ def _module_blocks(
         members = {f.node_id for f in module.funcs}
         _ensure_block_spine(module.funcs)
         roots = _module_roots(module, graph)
+        # Each block is deliberately self-contained: a function shown in an
+        # earlier block is still shown here, because a reader who jumps to one
+        # module's block should not find its tree missing rows that happen to
+        # have been spent elsewhere.
         nodes = _fit(roots, project, graph, max_lines, members=members)
-        emitted |= {f.node_id for f in module.funcs}
         blocks.append(
             Block(
                 title=module.path.rsplit('/', 1)[-1],
