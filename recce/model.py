@@ -196,24 +196,27 @@ class Project:
     # Functions are attached to a module when it is extracted and not after,
     # and the scoring passes mutate `Func` objects in place, which changes what
     # the index points at but never its keys.
-    #
-    # It is handed out as a read-only view rather than copied. Every caller
-    # holds the one dict — `_Resolver` keeps it for the length of a resolve —
-    # so a caller who wrote to it would be writing into the cache every later
-    # pass reads. The proxy costs nothing and makes that a `TypeError` instead
-    # of a silent corruption; a caller who wants a mutable one says `dict(...)`.
     _index: Optional[Mapping[str, Func]] = field(
         default=None, repr=False, compare=False
     )
-    _index_size: int = field(default=-1, repr=False, compare=False)
+    _indexed_module_count: int = field(default=-1, repr=False, compare=False)
 
     def funcs(self) -> List[Func]:
         return list(self.by_id().values())
 
     def by_id(self) -> Mapping[str, Func]:
-        if self._index is None or self._index_size != len(self.modules):
+        """Every function in the project, keyed by `node_id`.
+
+        Read-only, and the same object every time rather than a copy. Every
+        caller holds the one mapping — `_Resolver` keeps it for the length of a
+        resolve — so a caller who wrote to it would be writing into the cache
+        every later pass reads. The proxy costs nothing and makes that a
+        `TypeError` instead of a silent corruption; a caller who wants a
+        mutable one says `dict(...)`.
+        """
+        if self._index is None or self._indexed_module_count != len(self.modules):
             self._index = MappingProxyType(
                 {f.node_id: f for m in self.modules.values() for f in m.funcs}
             )
-            self._index_size = len(self.modules)
+            self._indexed_module_count = len(self.modules)
         return self._index
