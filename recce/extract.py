@@ -77,6 +77,11 @@ _BRANCH_NODES = (
 
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
+# `@overload` declares a signature; it does not define a function. requests
+# writes three `HTTPBasicAuth.__init__`s — two overloads and the real one —
+# and emitting a row for each says the class has three constructors.
+_OVERLOAD_DECORATORS = frozenset({'overload'})
+
 # Loops are counted apart from branches because a note that claims one can be
 # checked against this. A comprehension counts: it is a loop the reader sees.
 _LOOP_NODES = (ast.For, ast.AsyncFor, ast.While, ast.comprehension)
@@ -344,6 +349,36 @@ def _arg_names(node: ast.AST) -> List[str]:
     names = [a.arg for a in list(getattr(spec, 'posonlyargs', [])) + list(spec.args)]
     names += [a.arg for a in spec.kwonlyargs]
     return [n for n in names if n not in ('self', 'cls')]
+
+
+def _is_overload(node: ast.AST) -> bool:
+    """Whether a def is a `@typing.overload` signature rather than a body."""
+    return any(
+        name.split('.')[-1] in _OVERLOAD_DECORATORS for name in _decorator_names(node)
+    )
+
+
+def _dedupe_definitions(funcs: List[Func]) -> List[Func]:
+    """Keep one entry per qualified name, the last, as Python itself does.
+
+    A name defined twice in a module is one function at runtime — the later
+    definition wins — and that is true whether the duplication came from an
+    `@overload` stub, a platform branch, or a `try`/`except ImportError` pair.
+    Emitting both put two identical rows in the map and, worse, gave two `Func`
+    objects the same `node_id`, so the index silently kept whichever it saw
+    last while the renderer walked a list that still had both.
+    """
+    ordered: Dict[str, Func] = {}
+    for func in funcs:
+        previous = ordered.get(func.qualname)
+        # The definition with the most in it wins, which picks the
+        # implementation over an `@overload` stub whose body is `...`, and the
+        # getter over the setter in a `@property` pair — both share a name, and
+        # the getter is the one that says what the attribute is. Ties go to the
+        # later definition, matching what Python itself would leave bound.
+        if previous is None or func.n_stmts >= previous.n_stmts:
+            ordered[func.qualname] = func
+    return list(ordered.values())
 
 
 def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Func:
@@ -614,13 +649,15 @@ def extract_module(
 
     for node in tree.body:
         if isinstance(node, _FUNC_NODES):
+            if _is_overload(node):
+                continue
             module.funcs.append(_make_func(node, module_name, str(path), None))
         elif isinstance(node, ast.ClassDef):
             bases = [_dotted_of(b)[2] for b in node.bases]
             decorators = _decorator_names(node)
             methods = []
             for stmt in node.body:
-                if isinstance(stmt, _FUNC_NODES):
+                if isinstance(stmt, _FUNC_NODES) and not _is_overload(stmt):
                     func = _make_func(stmt, module_name, str(path), node.name)
                     module.funcs.append(func)
                     methods.append(func.qualname)
@@ -661,9 +698,9 @@ def extract_module(
                         )
                     )
         elif isinstance(node, ast.If) and _is_main_guard(node):
-            calls = _body_metrics(node.body)[4]
-            module.main_calls = calls
+            module.main_calls = _body_metrics(node.body)[4]
 
+    module.funcs = _dedupe_definitions(module.funcs)
     return module
 
 

@@ -211,3 +211,89 @@ def test_imports_in_a_try_except_fallback_are_recorded(build):
         'pkg.fast.go',
         'pkg.slow.go',
     )
+
+
+def test_the_function_index_is_built_once_and_reused(build):
+    """Mapping the stdlib rebuilt a 55,710-entry dict 166 times."""
+    project, _, _, _ = build({'a.py': '"""P."""\n\n\ndef go():\n    pass\n'}, 'a.py')
+    first = project.by_id()
+    assert project.by_id() is first
+
+
+def test_the_index_notices_a_module_arriving_late(build):
+    """The guard is O(1), so it has to catch the one mutation that matters."""
+    from pathlib import Path
+
+    from recce.extract import extract_module
+
+    project, _, _, _ = build({'a.py': '"""P."""\n\n\ndef go():\n    pass\n'}, 'a.py')
+    assert 'a::go' in project.by_id()
+    extra = extract_module(Path(project.modules['a'].path), 'b')
+    project.modules['b'] = extra
+    assert 'b::go' in project.by_id()
+
+
+def test_overload_stubs_are_not_functions(build):
+    """requests writes three `HTTPBasicAuth.__init__`s: two overloads and one body.
+
+    Emitting a row for each says the class has three constructors, and gives
+    three `Func` objects the same `node_id` — so the index kept one while the
+    renderer walked a list holding all three.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\nfrom typing import overload\n\n\nclass C:\n'
+                '    @overload\n    def go(self, x: int) -> int: ...\n\n'
+                '    @overload\n    def go(self, x: str) -> str: ...\n\n'
+                '    def go(self, x):\n        if x:\n            return x\n        return None\n'
+            )
+        },
+        'a.py',
+    )
+    goes = [f for f in project.funcs() if f.qualname == 'C.go']
+    assert len(goes) == 1
+    assert goes[0].n_branches == 1  # the real body, not a stub
+
+
+def test_every_function_has_a_distinct_node_id(build):
+    """A duplicate id makes the index and the render disagree about what exists."""
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\nimport sys\n\n\n'
+                'if sys.platform == "win32":\n'
+                '    def go():\n        return 1\n'
+                'else:\n'
+                '    def go():\n        return 2\n\n\n'
+                'def other():\n    return go()\n'
+            )
+        },
+        'a.py',
+    )
+    ids = [f.node_id for f in project.funcs()]
+    assert len(ids) == len(set(ids)), ids
+
+
+def test_a_property_pair_keeps_the_getter(build):
+    """A getter and its setter share a qualified name; only one row is right.
+
+    httpx's `Headers.encoding` is a five-branch getter beside a two-line
+    setter, and keeping whichever came last kept the setter.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\n\nclass C:\n'
+                '    @property\n    def enc(self):\n'
+                '        for name in ("utf-8", "latin-1"):\n'
+                '            if name:\n                return name\n'
+                '        return None\n\n'
+                '    @enc.setter\n    def enc(self, value):\n        self._enc = value\n'
+            )
+        },
+        'a.py',
+    )
+    kept = [f for f in project.funcs() if f.qualname == 'C.enc']
+    assert len(kept) == 1
+    assert kept[0].n_branches == 2  # the getter, not the one-line setter

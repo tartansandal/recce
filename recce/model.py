@@ -170,8 +170,25 @@ class Project:
     # package states its entry points rather than leaving them to be inferred.
     declared_entries: List[str] = field(default_factory=list)
 
+    # Built on first use and kept. The pipeline fills `modules` during
+    # discovery and never adds to it afterwards, so the index is stable for
+    # every pass that reads it — and the passes read it constantly. Mapping the
+    # standard library rebuilt a 55,710-entry dict 166 times, which is about
+    # nine million insertions to answer questions the first one had answered.
+    #
+    # `len(self.modules)` is the guard rather than a full signature: it is O(1),
+    # and adding a module is the only mutation that can invalidate the index.
+    # Functions are attached to a module when it is extracted and not after,
+    # and the scoring passes mutate `Func` objects in place, which changes what
+    # the index points at but never its keys.
+    _index: Optional[Dict[str, Func]] = field(default=None, repr=False, compare=False)
+    _index_size: int = field(default=-1, repr=False, compare=False)
+
     def funcs(self) -> List[Func]:
-        return [f for m in self.modules.values() for f in m.funcs]
+        return list(self.by_id().values())
 
     def by_id(self) -> Dict[str, Func]:
-        return {f.node_id: f for f in self.funcs()}
+        if self._index is None or self._index_size != len(self.modules):
+            self._index = {f.node_id: f for m in self.modules.values() for f in m.funcs}
+            self._index_size = len(self.modules)
+        return self._index
