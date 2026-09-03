@@ -402,6 +402,17 @@ def _ask(
             'model': model,
             'prompt': PROMPT.format(source=source, limit=MAX_NOTE_CHARS, shape=shape),
             'stream': False,
+            # Every Qwen from 3.6 on thinks by default, and the reasoning goes
+            # in front of the answer. `num_predict` below is 60 tokens, so the
+            # thinking consumes the whole budget and `response` comes back
+            # empty or as a truncated fragment of reasoning — `_reduce` then
+            # takes its first line and every note is rejected as 'empty'. The
+            # report says the model is useless when what is wrong is the ask.
+            # Sent unconditionally: Ollama ignores it on models that cannot
+            # think, verified against qwen2.5-coder:7b, which answers normally
+            # rather than erroring. Note that Qwen 3.6 dropped the `/no_think`
+            # soft switch, so this field is the only way left to say it.
+            'think': False,
             'options': {
                 # Zero, not merely low: this is description, not composition,
                 # and a map that changes wording between runs is a map nobody
