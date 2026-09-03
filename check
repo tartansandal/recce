@@ -3,12 +3,12 @@
 # Lint, format-check and test the tree on both interpreters that matter.
 #
 # Two are needed, and the reason is a bug this script exists because of.
-# `.python-version` pins the dev venv to 3.9, the compatibility floor, so
-# `uv run pytest` only ever exercises that. But recce parses source with the
-# interpreter it runs on, and that interpreter is whatever the user has —
-# `ast.Ellipsis` was deprecated in 3.8 and *removed* in 3.12, so a reference to
-# it passed every test on 3.9 and crashed on 3.14 the moment someone pointed
-# recce at a codebase using `Callable[..., X]`.
+# `.python-version` pins the dev venv to the floor, so `uv run pytest` only
+# ever exercises that. But recce parses source with the interpreter it runs on,
+# and that interpreter is whatever the user has — `ast.Ellipsis` was deprecated
+# in 3.8 and *removed* in 3.12, so a reference to it passed every test on the
+# floor and crashed on 3.14 the moment someone pointed recce at a codebase
+# using `Callable[..., X]`.
 #
 # The floor catches syntax and library use that is too new. The ceiling catches
 # ast API that has since been removed. Neither run is redundant.
@@ -26,7 +26,7 @@ echo '== ruff =='
 uv run ruff check .
 uv run ruff format --check .
 
-echo '== pytest on the 3.9 floor =='
+echo '== pytest on the floor =='
 uv run pytest -q
 
 # Newest interpreter uv can find. Update as new releases land; the point is to

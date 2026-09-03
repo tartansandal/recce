@@ -51,7 +51,9 @@ def test_prose_is_outside_the_fence_and_only_trees_are_inside(build):
     fences = [i for i, line in enumerate(lines) if line == '```']
     assert len(fences) % 2 == 0 and fences
     inside = set()
-    for start, end in zip(fences[::2], fences[1::2]):
+    # strict: the assertion above already guarantees the pairing, and a fence
+    # count that goes odd should fail loudly rather than silently drop the last.
+    for start, end in zip(fences[::2], fences[1::2], strict=True):
         inside.update(range(start, end + 1))
     for index, line in enumerate(lines):
         if line.startswith(('#', '- ')):

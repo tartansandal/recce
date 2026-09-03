@@ -24,6 +24,7 @@ Two extraction choices are worth knowing before you change anything:
 from __future__ import annotations
 
 import ast
+import builtins
 import os
 import re
 import tokenize
@@ -166,27 +167,31 @@ def compress_type(node: Optional[ast.AST]) -> Optional[str]:
     Anything not recognised is unparsed as written, so an unusual annotation
     degrades to being verbose rather than to being wrong.
     """
-    if node is None:
-        return None
-    if isinstance(node, ast.Constant):
-        if node.value is None:
+    match node:
+        case None:
+            return None
+        case ast.Constant(value=None):
             return 'None'
-        if node.value is Ellipsis:
+        case ast.Constant(value=builtins.Ellipsis):
             return '...'
-        # A string annotation is a forward reference; the text is the type.
-        return str(node.value) if isinstance(node.value, str) else _unparse(node)
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        # `typing.Optional` and `t.Optional` both mean Optional to a reader.
-        return node.attr
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        return '{}|{}'.format(compress_type(node.left), compress_type(node.right))
-    if isinstance(node, ast.Subscript):
-        return _compress_subscript(node)
-    if isinstance(node, ast.Tuple):
-        return ', '.join(compress_type(e) or '?' for e in node.elts)
-    return _unparse(node)
+        case ast.Constant(value=str() as text):
+            # A string annotation is a forward reference; the text is the type.
+            return text
+        case ast.Constant():
+            return _unparse(node)
+        case ast.Name(id=name):
+            return name
+        case ast.Attribute(attr=attr):
+            # `typing.Optional` and `t.Optional` both mean Optional to a reader.
+            return attr
+        case ast.BinOp(op=ast.BitOr(), left=left, right=right):
+            return '{}|{}'.format(compress_type(left), compress_type(right))
+        case ast.Subscript():
+            return _compress_subscript(node)
+        case ast.Tuple(elts=elts):
+            return ', '.join(compress_type(e) or '?' for e in elts)
+        case _:
+            return _unparse(node)
 
 
 def _compress_subscript(node: ast.Subscript) -> str:
@@ -382,33 +387,39 @@ def _literal_shape(node: Optional[ast.AST]) -> Optional[str]:
     Only the outline is wanted. A list of tuples is worth saying; which tuples
     is not, and the reader can open the file for that.
     """
-    if node is None:
-        return None
-    if isinstance(node, ast.Call):
-        _, attr, dotted = _dotted_of(node.func)
-        if dotted.startswith('re.compile') or attr == 'compile':
-            return 'regex'
-        return '{}(...)'.format(attr)
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        elts = node.elts
-        opener, closer = ('[', ']') if isinstance(node, ast.List) else ('(', ')')
-        if isinstance(node, ast.Set):
-            opener, closer = '{', '}'
-        if not elts:
-            return '{}{}'.format(opener, closer)
-        inner = _literal_shape(elts[0]) or '?'
-        return '{}{}{}'.format(opener, inner, closer)
-    if isinstance(node, ast.Dict):
-        if not node.keys:
+    match node:
+        case None:
+            return None
+        case ast.Call(func=func):
+            _, attr, dotted = _dotted_of(func)
+            if dotted.startswith('re.compile') or attr == 'compile':
+                return 'regex'
+            return '{}(...)'.format(attr)
+        case ast.List(elts=elts):
+            return _sequence_shape(elts, '[', ']')
+        case ast.Tuple(elts=elts):
+            return _sequence_shape(elts, '(', ')')
+        case ast.Set(elts=elts):
+            return _sequence_shape(elts, '{', '}')
+        case ast.Dict(keys=[], values=[]):
             return '{}'
-        key = _literal_shape(node.keys[0]) or '?'
-        val = _literal_shape(node.values[0]) or '?'
-        return '{{{}: {}}}'.format(key, val)
-    if isinstance(node, ast.Constant):
-        return type(node.value).__name__
-    if isinstance(node, ast.JoinedStr):
-        return 'str'
-    return None
+        case ast.Dict(keys=[key, *_], values=[value, *_]):
+            return '{{{}: {}}}'.format(
+                _literal_shape(key) or '?', _literal_shape(value) or '?'
+            )
+        case ast.Constant(value=value):
+            return type(value).__name__
+        case ast.JoinedStr():
+            return 'str'
+        case _:
+            return None
+
+
+def _sequence_shape(elts: List[ast.expr], opener: str, closer: str) -> str:
+    """A container's outline: its brackets, and the shape of its first element."""
+    if not elts:
+        return opener + closer
+    return '{}{}{}'.format(opener, _literal_shape(elts[0]) or '?', closer)
 
 
 def _header_comment(source: str) -> Optional[str]:

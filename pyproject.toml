@@ -8,16 +8,26 @@
 # and pytest do not drift between checkouts.
 #
 # `requires-python` is the floor the code supports, and `.python-version` pins
-# the dev venv to that same 3.9 so a 3.10-only construct fails here rather than
-# on the server. Note the floor cuts both ways: `ast.parse` on 3.9 cannot read
-# 3.10+ syntax, so mapping a codebase that uses `match` needs a newer
-# interpreter to run recce, even though recce itself stays 3.9-compatible.
+# the dev venv to it so a construct from a later release fails here rather than
+# on the server.
+#
+# The floor moved from 3.9 to 3.11 deliberately, and what it bought is worth
+# recording because the obvious reason is not one of them. What recce can
+# *parse* is set by the interpreter it runs on, not by this line — a
+# 3.9-compatible recce running on 3.14 reads `match` and PEP 695 perfectly
+# well, and running the same code on 3.9 does not. So the floor was never what
+# limited the syntax recce could read.
+#
+# What 3.11 actually buys is `tomllib` in the stdlib, which is what lets entry
+# points be read out of `[project.scripts]` without taking a dependency, plus
+# `match` for the AST dispatch in extract.py and `sys.stdlib_module_names` for
+# telling the standard library apart from everything else.
 
 [project]
 name = 'recce'
 version = '0.1.0'
 description = 'A reconnaissance pass over unfamiliar code: the spine, who calls whom, and what is external.'
-requires-python = '>=3.9'
+requires-python = '>=3.11'
 dependencies = []
 
 [project.scripts]
