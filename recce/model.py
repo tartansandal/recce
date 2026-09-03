@@ -105,6 +105,16 @@ class Func:
         return self.cls is not None
 
 
+    @property
+    def decorator_tails(self) -> List[str]:
+        """The last segment of each decorator name.
+
+        `@overload`, `@typing.overload` and `@t.overload` are one decorator,
+        and every caller cares which decorator it is rather than how the file
+        chose to import it.
+        """
+        return [d.split('.')[-1] for d in self.decorators]
+
 @dataclass
 class Class:
     """A class definition, kept for the data-shapes section.

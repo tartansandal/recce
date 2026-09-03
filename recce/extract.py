@@ -79,8 +79,16 @@ _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
 # `@overload` declares a signature; it does not define a function. requests
 # writes three `HTTPBasicAuth.__init__`s — two overloads and the real one —
-# and emitting a row for each says the class has three constructors.
+# and emitting a row for each says the class has three constructors. Stubs are
+# extracted and then lose to the implementation in `_dedupe_definitions`,
+# rather than being skipped outright: a name that has nothing but stubs is
+# still a name, and skipping it emptied whole modules out of the map.
 _OVERLOAD_DECORATORS = frozenset({'overload'})
+
+# The other half of a `@property` pair. A setter and a deleter share the
+# getter's name, and the getter is the definition that says what the attribute
+# is, so it wins however short its body.
+_MUTATOR_DECORATORS = frozenset({'setter', 'deleter'})
 
 # Loops are counted apart from branches because a note that claims one can be
 # checked against this. A comprehension counts: it is a loop the reader sees.
@@ -351,33 +359,71 @@ def _arg_names(node: ast.AST) -> List[str]:
     return [n for n in names if n not in ('self', 'cls')]
 
 
-def _is_overload(node: ast.AST) -> bool:
-    """Whether a def is a `@typing.overload` signature rather than a body."""
-    return any(
-        name.split('.')[-1] in _OVERLOAD_DECORATORS for name in _decorator_names(node)
-    )
+def _definition_rank(func: Func) -> Tuple[int, int, int]:
+    """Higher wins, in the two ways one name comes to be defined twice.
+
+    An implementation beats its `@overload` stubs, and a `@property` getter
+    beats its setter at any size. Only when neither applies does body size
+    decide.
+    """
+    tails = func.decorator_tails
+    stub = any(t in _OVERLOAD_DECORATORS for t in tails)
+    mutator = any(t in _MUTATOR_DECORATORS for t in tails)
+    return (0 if stub else 1, 0 if mutator else 1, func.n_stmts)
+
+
+def _merge_calls(winner: Func, loser: Func) -> None:
+    """Keep the discarded definition's call sites on the one that survives.
+
+    A `@property` setter is dropped in favour of its getter, but the calls in
+    its body are the attribute's calls and they are the only record that those
+    edges exist. Losing them drops an edge the reader needed and, worse, can
+    leave the callee with no callers at all — which `rank` reads as a way into
+    the codebase. Calls are still unresolved here, so the key is the source
+    shape; `lineno` is left out so a call both bodies make appears once.
+    """
+    seen = {(c.dotted, c.root, c.attr) for c in winner.calls}
+    for call in loser.calls:
+        key = (call.dotted, call.root, call.attr)
+        if key not in seen:
+            seen.add(key)
+            winner.calls.append(call)
 
 
 def _dedupe_definitions(funcs: List[Func]) -> List[Func]:
-    """Keep one entry per qualified name, the last, as Python itself does.
+    """Keep one entry per qualified name, the one the reader should see.
 
-    A name defined twice in a module is one function at runtime — the later
-    definition wins — and that is true whether the duplication came from an
-    `@overload` stub, a platform branch, or a `try`/`except ImportError` pair.
+    A name defined twice in a module is one function at runtime, and Python
+    binds the last definition. recce ranks instead: an implementation beats its
+    `@overload` stubs and a getter beats its setter, because those are the pairs
+    where the last definition is not the informative one. Ties go to the later
+    definition, which is what Python would leave bound.
+
     Emitting both put two identical rows in the map and, worse, gave two `Func`
-    objects the same `node_id`, so the index silently kept whichever it saw
-    last while the renderer walked a list that still had both.
+    objects the same `node_id`, so the index silently kept whichever it saw last
+    while the renderer walked a list that still had both.
+
+    Only definitions recce extracts reach here. A def inside an `if` or a `try`
+    body is not seen at all, so a platform branch and a `try`/`except
+    ImportError` pair are a gap rather than a case this handles.
     """
     ordered: Dict[str, Func] = {}
     for func in funcs:
         previous = ordered.get(func.qualname)
-        # The definition with the most in it wins, which picks the
-        # implementation over an `@overload` stub whose body is `...`, and the
-        # getter over the setter in a `@property` pair — both share a name, and
-        # the getter is the one that says what the attribute is. Ties go to the
-        # later definition, matching what Python itself would leave bound.
-        if previous is None or func.n_stmts >= previous.n_stmts:
+        if previous is None:
             ordered[func.qualname] = func
+            continue
+        # The getter wins a `@property` pair outright — both share a name, and
+        # the getter is the one that says what the attribute is, however short
+        # its body. Otherwise the definition with the most in it wins. Ties go
+        # to the later definition, matching what Python itself would leave
+        # bound. The loser's calls move across rather than dying with it.
+        if _definition_rank(func) >= _definition_rank(previous):
+            winner, loser = func, previous
+        else:
+            winner, loser = previous, func
+        _merge_calls(winner, loser)
+        ordered[func.qualname] = winner
     return list(ordered.values())
 
 
@@ -649,15 +695,13 @@ def extract_module(
 
     for node in tree.body:
         if isinstance(node, _FUNC_NODES):
-            if _is_overload(node):
-                continue
             module.funcs.append(_make_func(node, module_name, str(path), None))
         elif isinstance(node, ast.ClassDef):
             bases = [_dotted_of(b)[2] for b in node.bases]
             decorators = _decorator_names(node)
             methods = []
             for stmt in node.body:
-                if isinstance(stmt, _FUNC_NODES) and not _is_overload(stmt):
+                if isinstance(stmt, _FUNC_NODES):
                     func = _make_func(stmt, module_name, str(path), node.name)
                     module.funcs.append(func)
                     methods.append(func.qualname)
@@ -701,6 +745,17 @@ def extract_module(
             module.main_calls = _body_metrics(node.body)[4]
 
     module.funcs = _dedupe_definitions(module.funcs)
+    # `methods` is collected while walking the class body, before the dedupe
+    # above has run, so a `@property` triple leaves three `C.enc` entries
+    # against the one `Func` that survived. Rebuild it from what actually
+    # exists rather than deduping the names on their own — one source of truth,
+    # whatever the dedupe rule becomes next.
+    by_class: Dict[str, List[str]] = {}
+    for func in module.funcs:
+        if func.cls is not None:
+            by_class.setdefault(func.cls, []).append(func.qualname)
+    for cls in module.classes:
+        cls.methods = by_class.get(cls.name, [])
     return module
 
 

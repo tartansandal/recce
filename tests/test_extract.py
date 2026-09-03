@@ -233,7 +233,7 @@ def test_the_index_notices_a_module_arriving_late(build):
     assert 'b::go' in project.by_id()
 
 
-def test_overload_stubs_are_not_functions(build):
+def test_overload_stubs_lose_to_the_implementation(build):
     """requests writes three `HTTPBasicAuth.__init__`s: two overloads and one body.
 
     Emitting a row for each says the class has three constructors, and gives
@@ -273,6 +273,102 @@ def test_every_function_has_a_distinct_node_id(build):
     )
     ids = [f.node_id for f in project.funcs()]
     assert len(ids) == len(set(ids)), ids
+
+
+def test_a_class_lists_the_methods_that_survived_dedupe(build):
+    """`methods` and `funcs` are two views of one thing; --json shows both."""
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\n\nclass C:\n'
+                '    @property\n    def enc(self):\n        return self._enc\n\n'
+                '    @enc.setter\n    def enc(self, value):\n        self._enc = value\n\n'
+                '    @enc.deleter\n    def enc(self):\n        del self._enc\n'
+            )
+        },
+        'a.py',
+    )
+    module = project.modules['a']
+    assert module.classes[0].methods == [
+        f.qualname for f in module.funcs if f.cls == 'C'
+    ]
+    assert module.classes[0].methods == ['C.enc']
+
+
+def test_a_dropped_setter_keeps_its_calls(build):
+    """The setter's calls are the attribute's calls, and the only record of them.
+
+    Worse than a missing edge: the callee can be left with no callers at all,
+    which `rank._entry_points` reads as a way into the codebase.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\n\ndef validate(v):\n    return v\n\n\nclass C:\n'
+                '    @property\n    def enc(self):\n'
+                '        for name in ("utf-8", "latin-1"):\n'
+                '            if name:\n                return name\n'
+                '        return None\n\n'
+                '    @enc.setter\n    def enc(self, value):\n'
+                '        self._enc = validate(value)\n'
+            )
+        },
+        'a.py',
+    )
+    kept = [f for f in project.funcs() if f.qualname == 'C.enc']
+    assert len(kept) == 1
+    assert 'validate' in [c.dotted for c in kept[0].calls]
+    assert project.by_id()['a::validate'].fan_in == 1
+
+
+def test_a_module_of_only_overloads_keeps_its_rows(build):
+    """Skipping stubs outright emptied `funcs`, and rank drops such a module.
+
+    `_select_modules` filters on `project.modules[n].funcs`, so a file whose
+    every def is an `@overload` left the map entirely — purpose line, Protocol
+    and all. The last stub survives dedupe instead.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""Codec protocol."""\n\n'
+                'from typing import Protocol, overload\n\n\n'
+                'class Codec(Protocol):\n'
+                '    @overload\n    def enc(self, x: int) -> int: ...\n'
+                '    @overload\n    def enc(self, x: str) -> str: ...\n\n\n'
+                '@overload\ndef go(x: int) -> int: ...\n'
+                '@overload\ndef go(x: str) -> str: ...\n'
+            )
+        },
+        'a.py',
+    )
+    module = project.modules['a']
+    assert [f.qualname for f in module.funcs] == ['Codec.enc', 'go']
+    assert module.classes[0].methods == ['Codec.enc']
+
+
+def test_a_trivial_getter_beats_a_validating_setter(build):
+    """The common idiom is a one-line getter beside a setter that checks.
+
+    Body size cannot decide this one: the setter is the larger definition and
+    keeping it renders the attribute as a mutator taking `value`.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                '"""P."""\n\n\nclass C:\n'
+                '    @property\n    def enc(self):\n        return self._enc\n\n'
+                '    @enc.setter\n    def enc(self, value):\n'
+                '        if not value:\n            raise ValueError(value)\n'
+                '        self._enc = value\n'
+            )
+        },
+        'a.py',
+    )
+    kept = [f for f in project.funcs() if f.qualname == 'C.enc']
+    assert len(kept) == 1
+    assert kept[0].decorators == ['property']
+    assert kept[0].args == []
 
 
 def test_a_property_pair_keeps_the_getter(build):
