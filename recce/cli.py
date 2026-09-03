@@ -56,9 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--model',
-        default=None,
+        nargs='?',
+        const=notes.AUTO,
+        default=notes.DEFAULT_MODEL,
         metavar='NAME',
-        help='Ollama model to write branch-shape notes with (e.g. qwen2.5-coder:7b)',
+        help=(
+            'Ollama model to write branch-shape notes with '
+            '(e.g. qwen2.5-coder:7b). Give it no value to pick an installed '
+            'one. Set RECCE_MODEL=auto to have notes without the flag'
+        ),
     )
     parser.add_argument(
         '--notes-limit',
@@ -109,11 +115,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # and the budget counts lines. Annotating twice is cheap and idempotent:
     # `plan` re-runs it to get roles and scores, and leaves `note` alone.
     report = None
-    if args.model and not args.no_llm:
+    model = args.model
+    if model == notes.AUTO and not args.no_llm:
+        # Resolved to a name before anything asks for a note: the note cache
+        # keys on the model, so leaving it as 'auto' would file every answer
+        # under a name no future run looks up.
+        model = notes.resolve_model(args.ollama_host)
+        if model is None:
+            print(
+                'recce: no usable model at {}; mapping without notes'.format(
+                    args.ollama_host
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print('recce: notes from {}'.format(model), file=sys.stderr)
+    if model and not args.no_llm:
         annotate(project, graph)
         report = notes.fill(
             project.funcs(),
-            model=args.model,
+            model=model,
             host=args.ollama_host,
             limit=args.notes_limit,
             use_cache=not args.no_cache,

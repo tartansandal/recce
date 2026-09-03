@@ -109,6 +109,11 @@ copies fit the budget. Ninety-nine passing tests never saw it.
   (3.9.6). `brew install ollama` pulls `python@3.14` as a dependency and it
   shadows the system one. Which interpreter runs recce decides what syntax it
   can read, so this matters more here than in most projects.
+- **`RECCE_MODEL=auto` turns notes on for every run in that shell**, which is
+  worth knowing when a map you did not expect to be annotated is, or when a
+  run takes twenty seconds instead of one. `--model` with no value does the
+  same for a single run; both resolve to a concrete model name before anything
+  is asked, because the cache keys on it.
 - **Notes are cached** under `$XDG_CACHE_HOME/recce`, so a rerun will not
   re-ask the model. The key covers the model name, `MAX_NOTE_CHARS`, the
   `PROMPT` text and the function source, so changing any of them invalidates

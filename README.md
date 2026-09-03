@@ -123,7 +123,24 @@ tell it: what a function's loops and branches actually do.
 
 ```sh
 ollama pull qwen2.5-coder:7b
-recce pkg/ --model qwen2.5-coder:7b
+recce pkg/ --model qwen2.5-coder:7b   # a model you name
+recce pkg/ --model                    # whichever installed one it finds
+```
+
+Given no value, `--model` picks from what Ollama has pulled: a code-trained
+family first — `qwen2.5-coder`, `deepseek-coder`, `codellama` and the like, in
+that order — and the smallest build of it, because a note is one line and the
+7B answers as well as the 32B and answers sooner. Failing those, the smallest
+model installed that is not an embedding model. It prints which one it chose,
+since the note cache is keyed on the model name and a map is only reproducible
+if you know what wrote it.
+
+Set `RECCE_MODEL=auto` to get that without the flag, or `RECCE_MODEL=<name>` to
+pin one:
+
+```sh
+export RECCE_MODEL=auto
+recce pkg/
 ```
 
 ```
@@ -133,7 +150,7 @@ main(argv)  ★
  │   loops over records, accumulates counts and bytes by status and route
 ```
 
-It is off by default and it fails soft. No Ollama, a timeout, a model that is
+It is off unless you ask — by flag or by `RECCE_MODEL` — and it fails soft. No Ollama, a timeout, a model that is
 not pulled — all of them leave the notes empty and the map renders exactly as
 it does without one.
 

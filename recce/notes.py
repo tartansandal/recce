@@ -45,6 +45,29 @@ from .model import SPINE, TRIVIAL, Func
 
 DEFAULT_HOST = os.environ.get('OLLAMA_HOST', 'http://127.0.0.1:11434')
 
+# What `--model` means when it is given no value, and what `RECCE_MODEL=auto`
+# asks for: pick a model off whatever Ollama has pulled.
+AUTO = 'auto'
+
+# `RECCE_MODEL` is the way to have notes without typing a model name on every
+# run. Notes stay off by default because they are the one part of a map that a
+# machine wrote: the deterministic pipeline gives the same map twice, and a
+# model at temperature 0.1 does not. Setting this is a decision to trade that.
+DEFAULT_MODEL = os.environ.get('RECCE_MODEL')
+
+# Preferred first. These are the families trained on code, which is what a
+# note about loops and branches asks for; anything else is a fallback that
+# still has to survive the same checks against the syntax tree.
+_PREFERRED_MODELS = (
+    'qwen2.5-coder',
+    'qwen3-coder',
+    'deepseek-coder',
+    'codegemma',
+    'codellama',
+    'starcoder2',
+    'granite-code',
+)
+
 # Past this the note stops being an annotation and becomes a paragraph
 # competing with the row it hangs under.
 MAX_NOTE_CHARS = 90
@@ -274,6 +297,45 @@ def clean(raw: str, n_loops: Optional[int] = None) -> Optional[str]:
         return None
     text = _trim(_reduce(raw))
     return text[0].lower() + text[1:] if text[:1].isupper() else text
+
+
+def installed_models(host: str = DEFAULT_HOST, timeout: float = 5.0) -> List[str]:
+    """Model names Ollama has pulled, smallest first, or [] if it cannot say.
+
+    Embedding models are dropped: they are installed for other tools, they do
+    not answer `/api/generate`, and picking one would turn "notes are off" into
+    "every note failed".
+    """
+    request = urllib.request.Request(host.rstrip('/') + '/api/tags')
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode('utf-8'))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return []
+    models = [
+        (m.get('size') or 0, m.get('name') or '')
+        for m in body.get('models', [])
+        if m.get('name') and 'embed' not in m['name']
+    ]
+    return [name for _, name in sorted(models)]
+
+
+def resolve_model(host: str = DEFAULT_HOST, timeout: float = 5.0) -> Optional[str]:
+    """The model `--model` with no value should use, or None if there is none.
+
+    A code-trained family wins, in the order `_PREFERRED_MODELS` lists them,
+    and the smallest build of it wins within that — a note is one line, so the
+    7B answers as well as the 32B and answers sooner. Failing all of those,
+    the smallest usable model installed: a weaker model writes worse notes but
+    not more dangerous ones, since every note is checked against the tree
+    before it is kept.
+    """
+    installed = installed_models(host, timeout)
+    for preferred in _PREFERRED_MODELS:
+        for name in installed:
+            if name.startswith(preferred):
+                return name
+    return installed[0] if installed else None
 
 
 def _ask(host: str, model: str, source: str, timeout: float) -> Optional[str]:

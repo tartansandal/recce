@@ -8,6 +8,7 @@ degradation is a feature with a test, not an assumption.
 from __future__ import annotations
 
 import hashlib
+import json
 
 from recce import notes
 from recce.model import KEEP, SPINE, TRIVIAL, Func
@@ -179,3 +180,82 @@ def test_the_cache_key_covers_the_prompt(monkeypatch):
     before = notes._key('m', source)
     monkeypatch.setattr(notes, '_PROMPT_DIGEST', 'deadbeef')
     assert notes._key('m', source) != before
+
+
+class _FakeTags:
+    """Stand-in for the /api/tags response body."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode('utf-8')
+
+
+def _tags(monkeypatch, models):
+    payload = {'models': [{'name': n, 'size': s} for n, s in models]}
+    monkeypatch.setattr(
+        notes.urllib.request, 'urlopen', lambda *a, **k: _FakeTags(payload)
+    )
+
+
+def test_a_code_model_wins_over_a_general_one(monkeypatch):
+    """A note about loops and branches is what these families are trained on."""
+    _tags(
+        monkeypatch, [('llama3:8b', 4_000_000_000), ('qwen2.5-coder:7b', 4_700_000_000)]
+    )
+    assert notes.resolve_model() == 'qwen2.5-coder:7b'
+
+
+def test_the_smallest_build_of_the_preferred_family_wins(monkeypatch):
+    """A note is one line: the 7B answers as well as the 32B and answers sooner."""
+    _tags(
+        monkeypatch,
+        [('qwen2.5-coder:32b', 20_000_000_000), ('qwen2.5-coder:7b', 4_700_000_000)],
+    )
+    assert notes.resolve_model() == 'qwen2.5-coder:7b'
+
+
+def test_preference_order_beats_size(monkeypatch):
+    """`_PREFERRED_MODELS` is a ranking, not a tie-break on bytes."""
+    _tags(
+        monkeypatch,
+        [('codellama:7b', 3_800_000_000), ('qwen2.5-coder:14b', 9_000_000_000)],
+    )
+    assert notes.resolve_model() == 'qwen2.5-coder:14b'
+
+
+def test_an_embedding_model_is_never_picked(monkeypatch):
+    """It does not answer /api/generate, so picking it fails every note."""
+    _tags(monkeypatch, [('nomic-embed-text:latest', 274_000_000)])
+    assert notes.installed_models() == []
+    assert notes.resolve_model() is None
+
+
+def test_a_general_model_is_the_fallback(monkeypatch):
+    """Weaker notes, not more dangerous ones — the tree check is unchanged."""
+    _tags(monkeypatch, [('mistral:7b', 4_100_000_000), ('phi3:mini', 2_200_000_000)])
+    assert notes.resolve_model() == 'phi3:mini'
+
+
+def test_no_ollama_resolves_to_no_model(monkeypatch):
+    def boom(*a, **k):
+        raise notes.urllib.error.URLError('refused')
+
+    monkeypatch.setattr(notes.urllib.request, 'urlopen', boom)
+    assert notes.installed_models() == []
+    assert notes.resolve_model() is None
+
+
+def test_bare_model_flag_asks_for_a_pick():
+    """`--model` with no value is the whole point of the auto path."""
+    from recce.cli import build_parser
+
+    assert build_parser().parse_args(['x', '--model']).model == notes.AUTO
+    assert build_parser().parse_args(['x', '--model', 'm:1b']).model == 'm:1b'
