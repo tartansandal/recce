@@ -311,8 +311,8 @@ def _effective_branches(func: Func) -> float:
     `value if value is not None else default` is a defaulting idiom, not a
     fork the reader has to hold in their head, and a constructor with six of
     them is doing less thinking than a loop with two real branches. Counting
-    them equally is what let `httpx`'s `Client.__init__` outscore
-    `Client.send`.
+    them equally is one of the three ways a constructor came to outrank the
+    function its module exists for; `_constructor_factor` has the case.
 
     Half rather than zero: a ternary inside a comprehension really is a
     decision, and the point is to stop them dominating, not to stop them
@@ -865,11 +865,11 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     # and the thin public wrappers as roots while the code doing the work sits
     # one level down and can never be one.
     #
-    # httpx is the case. `Client.send` outscores `Client.__init__` by a
-    # distance and has two internal callers, so the block led with two
-    # constructors and the reader never met the function the module exists
-    # for. The module's best-scoring function is promoted when nothing else
-    # would have put it near the top.
+    # It is the third way into the `_constructor_factor` case: `Client.send`
+    # has two internal callers, so being called at all kept the best function
+    # in httpx's `_client.py` out of the roots while the constructors led.
+    # The module's best-scoring function is promoted when nothing else would
+    # have put it near the top.
     best = _best_in(module.funcs)
     if best is not None and best not in chosen[:2]:
         chosen.insert(0, best)

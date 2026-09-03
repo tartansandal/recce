@@ -267,9 +267,7 @@ class _BodyMetrics(NamedTuple):
 def _body_metrics(body: Iterable[ast.stmt]) -> _BodyMetrics:
     """Measure a function body in one walk.
 
-    The fields are named in `_BodyMetrics`. The enumeration that used to stand
-    here fell two behind what the function returns, which is what a positional
-    tuple lets happen.
+    The fields are named in `_BodyMetrics`.
 
     The string count is the least obvious and the most useful. A function
     thick with string literals is almost always building output, and output
