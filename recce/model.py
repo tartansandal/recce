@@ -80,6 +80,7 @@ class Func:
     n_stmts: int = 0
     n_branches: int = 0
     n_loops: int = 0
+    n_ternaries: int = 0
     n_strings: int = 0
     loc: int = 0
     cls: Optional[str] = None

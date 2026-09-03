@@ -217,17 +217,21 @@ def _score(funcs: Sequence[Func], graph: Graph) -> None:
     """
     if not funcs:
         return
-    branches = _norm([f.n_branches for f in funcs])
+    branches = _norm([_effective_branches(f) for f in funcs])
     sizes = _norm([f.loc for f in funcs])
     fan_ins = _norm([f.fan_in for f in funcs])
     fan_outs = _norm([len(graph.callees(f.node_id)) for f in funcs])
     for index, func in enumerate(funcs):
         func.score = (
-            0.45 * branches[index]
-            + 0.25 * sizes[index]
-            + 0.15 * fan_ins[index]
-            + 0.15 * fan_outs[index]
-        ) * _presentation_factor(func)
+            (
+                0.45 * branches[index]
+                + 0.25 * sizes[index]
+                + 0.15 * fan_ins[index]
+                + 0.15 * fan_outs[index]
+            )
+            * _presentation_factor(func)
+            * _constructor_factor(func)
+        )
 
 
 # A helper this size is met inside its caller and not navigated to. The bounds
@@ -236,6 +240,44 @@ def _score(funcs: Sequence[Func], graph: Graph) -> None:
 # which is six lines with a loop and a branch in it.
 _TRIVIAL_LOC = 8
 _TRIVIAL_BRANCHES = 2
+
+
+# Dunders that are wiring rather than behaviour. A constructor branches once
+# per optional argument, which is the same shape as branching once per case in
+# a dispatch table and means something entirely different.
+_WIRING_METHODS = frozenset(
+    {'__init__', '__new__', '__post_init__', '__repr__', '__str__', '__eq__'}
+)
+
+
+def _effective_branches(func: Func) -> float:
+    """Branch count with conditional expressions worth half a decision each.
+
+    `value if value is not None else default` is a defaulting idiom, not a
+    fork the reader has to hold in their head, and a constructor with six of
+    them is doing less thinking than a loop with two real branches. Counting
+    them equally is what let `httpx`'s `Client.__init__` outscore
+    `Client.send`.
+
+    Half rather than zero: a ternary inside a comprehension really is a
+    decision, and the point is to stop them dominating, not to stop them
+    counting.
+    """
+    return func.n_branches - 0.5 * func.n_ternaries
+
+
+def _constructor_factor(func: Func) -> float:
+    """Discount setup methods, which branch a lot and decide little.
+
+    Found on `httpx`: `Client.__init__` and `AsyncClient.__init__` outscored
+    every other method in `_client.py` and took the whole block's line budget,
+    leaving `Client.send` — the function the module exists for — off the map.
+    Argument wrangling looks like logic to a branch counter.
+
+    A discount rather than a veto, because a constructor that really does the
+    work should still be able to win.
+    """
+    return 0.6 if func.name in _WIRING_METHODS else 1.0
 
 
 def _presentation_factor(func: Func) -> float:
@@ -620,7 +662,9 @@ def _module_blocks(
     knows they are seeing eight modules of thirty can go and ask for the rest.
     """
     blocks: List[Block] = []
-    for name in _select_modules(project, max_blocks):
+    chosen = _select_modules(project, max_blocks)
+    titles = _block_titles([project.modules[n].path for n in chosen])
+    for name in chosen:
         module = project.modules[name]
         if not module.funcs:
             continue
@@ -634,7 +678,7 @@ def _module_blocks(
         nodes = _fit(roots, project, graph, max_lines, members=members)
         blocks.append(
             Block(
-                title=module.path.rsplit('/', 1)[-1],
+                title=titles[module.path],
                 purpose=module.doc or module.header_comment,
                 roots=nodes,
             )
@@ -653,6 +697,33 @@ def _ensure_block_spine(funcs: Sequence[Func]) -> None:
     if not candidates or any(f.role == SPINE for f in candidates):
         return
     max(candidates, key=lambda f: (f.score, -f.lineno)).role = SPINE
+
+
+def _block_titles(paths: Sequence[str]) -> Dict[str, str]:
+    """Name each block by the shortest path suffix that is unique among them.
+
+    A basename alone is usually right and occasionally ambiguous. Flask has
+    `flask/app.py` and `flask/sansio/app.py`, and a map with two blocks both
+    headed `app.py` is asking the reader to guess which is which — the one
+    question a heading exists to answer.
+
+    Only the blocks in this map are considered, so a name stays short unless
+    something it is actually shown beside forces it longer.
+    """
+    titles: Dict[str, str] = {}
+    for path in paths:
+        parts = path.split('/')
+        for depth in range(1, len(parts) + 1):
+            candidate = '/'.join(parts[-depth:])
+            clash = any(
+                other != path and other.endswith('/' + candidate) for other in paths
+            )
+            if not clash:
+                titles[path] = candidate
+                break
+        else:
+            titles[path] = path
+    return titles
 
 
 def _is_test_module(module) -> bool:
@@ -709,7 +780,29 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     substantial = [f for f in roots if f.role != TRIVIAL]
     chosen = substantial or roots
     chosen.sort(key=lambda f: (-f.score, f.lineno))
+
+    # Being uncalled is what makes something a way in, but it is not what
+    # makes it worth reading, and in a class-heavy module the two come apart
+    # badly. Having callers disqualifies you, which leaves the constructors
+    # and the thin public wrappers as roots while the code doing the work sits
+    # one level down and can never be one.
+    #
+    # httpx is the case. `Client.send` outscores `Client.__init__` by a
+    # distance and has two internal callers, so the block led with two
+    # constructors and the reader never met the function the module exists
+    # for. The module's best-scoring function is promoted when nothing else
+    # would have put it near the top.
+    best = _best_in(module.funcs)
+    if best is not None and best not in chosen[:2]:
+        chosen.insert(0, best)
+
     return chosen or sorted(module.funcs, key=lambda f: f.lineno)[:1]
+
+
+def _best_in(funcs: Sequence[Func]) -> Optional[Func]:
+    """The function in a module most worth reading, trivia excluded."""
+    candidates = [f for f in funcs if f.role != TRIVIAL]
+    return max(candidates, key=lambda f: (f.score, -f.lineno)) if candidates else None
 
 
 def _entry_blocks(

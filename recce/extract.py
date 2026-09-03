@@ -84,6 +84,52 @@ _CONTAINER_SHORTHAND = {
 }
 
 
+# reStructuredText underlines the title of a section with a run of punctuation.
+# Any of these, three or more, on the line under a heading.
+_REST_UNDERLINE = frozenset('=-`:\'"~^_*+#<>')
+
+
+def _strip_rest_title(text: str) -> str:
+    """Drop leading reST section titles so the summary is the prose below them.
+
+    The `name\n~~~~` convention opens the module docstring of a great deal of
+    older Python. `requests` uses it in every module, and taking the first
+    paragraph gave seven of its eight blocks the purpose line
+    `requests.cookies ~~~~~~~~~~~~~~~~` — punctuation presented to the reader
+    as a statement of what the module is for.
+
+    A title is a line followed by a line of one repeated punctuation mark, at
+    least three long. Both lines go, and repeatedly, since an overline puts one
+    above the title as well.
+    """
+    lines = text.strip().splitlines()
+    changed = True
+    while changed and lines:
+        changed = False
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        # An overline sits above the title, so a rule in first position is not
+        # a summary either — drop it and let the title+underline case follow.
+        if lines and _is_rule(lines[0]):
+            lines.pop(0)
+            changed = True
+            continue
+        if len(lines) >= 2 and _is_rule(lines[1]):
+            del lines[:2]
+            changed = True
+    return '\n'.join(lines).strip()
+
+
+def _is_rule(line: str) -> bool:
+    """Whether a line is a run of one punctuation mark, reST's section rule."""
+    stripped = line.strip()
+    return (
+        len(stripped) >= 3
+        and len(set(stripped)) == 1
+        and stripped[0] in _REST_UNDERLINE
+    )
+
+
 def first_sentence(text: Optional[str]) -> Optional[str]:
     """Return the first sentence of a docstring, collapsed onto one line.
 
@@ -93,7 +139,7 @@ def first_sentence(text: Optional[str]) -> Optional[str]:
     """
     if not text:
         return None
-    para = text.strip().split('\n\n')[0]
+    para = _strip_rest_title(text).split('\n\n')[0]
     para = ' '.join(para.split())
     if not para:
         return None
@@ -125,6 +171,8 @@ def compress_type(node: Optional[ast.AST]) -> Optional[str]:
     if isinstance(node, ast.Constant):
         if node.value is None:
             return 'None'
+        if node.value is Ellipsis:
+            return '...'
         # A string annotation is a forward reference; the text is the type.
         return str(node.value) if isinstance(node.value, str) else _unparse(node)
     if isinstance(node, ast.Name):
@@ -138,10 +186,6 @@ def compress_type(node: Optional[ast.AST]) -> Optional[str]:
         return _compress_subscript(node)
     if isinstance(node, ast.Tuple):
         return ', '.join(compress_type(e) or '?' for e in node.elts)
-    if isinstance(node, ast.Ellipsis) or (
-        isinstance(node, ast.Constant) and node.value is Ellipsis
-    ):
-        return '...'
     return _unparse(node)
 
 
@@ -219,6 +263,7 @@ def _body_metrics(
     n_stmts = 0
     n_branches = 0
     n_loops = 0
+    n_ternaries = 0
     n_strings = 0
     returns_keys: List[str] = []
     calls: List[Call] = []
@@ -230,6 +275,8 @@ def _body_metrics(
                 n_branches += 1
             if isinstance(node, _LOOP_NODES):
                 n_loops += 1
+            if isinstance(node, ast.IfExp):
+                n_ternaries += 1
             if _is_prose_string(node):
                 n_strings += 1
             if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
@@ -251,7 +298,7 @@ def _body_metrics(
     # than source order. The map reads top to bottom the way the function does,
     # which means the line number is what orders the children.
     calls.sort(key=lambda c: c.lineno)
-    return n_stmts, n_branches, n_loops, calls, returns_keys, n_strings
+    return n_stmts, n_branches, n_loops, n_ternaries, calls, returns_keys, n_strings
 
 
 def _is_prose_string(node: ast.AST) -> bool:
@@ -290,9 +337,15 @@ def _arg_names(node: ast.AST) -> List[str]:
 
 
 def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Func:
-    n_stmts, n_branches, n_loops, calls, returns_keys, n_strings = _body_metrics(
-        node.body  # type: ignore[attr-defined]
-    )
+    (
+        n_stmts,
+        n_branches,
+        n_loops,
+        n_ternaries,
+        calls,
+        returns_keys,
+        n_strings,
+    ) = _body_metrics(node.body)  # type: ignore[attr-defined]
     doc = ast.get_docstring(node)  # type: ignore[arg-type]
     if doc:
         n_stmts -= 1  # the docstring is an Expr statement, not work
@@ -314,6 +367,7 @@ def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Fun
         n_stmts=max(n_stmts, 0),
         n_branches=n_branches,
         n_loops=n_loops,
+        n_ternaries=n_ternaries,
         n_strings=max(n_strings, 0),
         returns_keys=returns_keys,
         loc=max(end - node.lineno + 1, 1),  # type: ignore[attr-defined]
@@ -558,7 +612,7 @@ def extract_module(
                         )
                     )
         elif isinstance(node, ast.If) and _is_main_guard(node):
-            calls = _body_metrics(node.body)[3]
+            calls = _body_metrics(node.body)[4]
             module.main_calls = calls
 
     return module

@@ -115,3 +115,42 @@ def test_a_file_that_will_not_parse_costs_only_that_file(build):
     )
     assert project.modules['bad'].parse_error
     assert project.modules['good'].funcs
+
+
+def test_ellipsis_in_an_annotation_compresses_rather_than_crashing():
+    """`ast.Ellipsis` was removed in 3.12; `Callable[..., X]` reaches this path.
+
+    The reference to it passed every test on the 3.9 floor and raised
+    AttributeError on 3.14, which is why `./check` runs both interpreters.
+    """
+    assert compress_type(parse_annotation('Callable[..., int]')) == 'Callable[..., int]'
+    assert compress_type(parse_annotation('Tuple[int, ...]')) == '(int, ...)'
+
+
+def test_a_rest_title_is_not_a_purpose(build):
+    """`requests` opens every module this way, and it broke seven of eight blocks.
+
+    Taking the first paragraph of `requests.cookies\\n~~~~~~~~~~~~~~~~\\n\\nreal
+    prose` yields the title and its underline, which then gets printed to the
+    reader as a statement of what the module is for.
+    """
+    doc = '"""\nrequests.cookies\n~~~~~~~~~~~~~~~~\n\nCompatibility code for cookie jars.\n"""'
+    project, _, _, text = build({'a.py': doc + '\n\n\ndef go():\n    pass\n'}, 'a.py')
+    assert project.modules['a'].doc == 'Compatibility code for cookie jars'
+    assert '~~~' not in text
+
+
+def test_an_overlined_rest_title_is_also_skipped():
+    from recce.extract import first_sentence
+
+    doc = '====\nTitle\n====\n\nThe actual summary here.'
+    assert first_sentence(doc) == 'The actual summary here'
+
+
+def test_an_underline_needs_to_be_one_repeated_mark():
+    """`a - b` under a line is prose, not a rule; only a run of one mark counts."""
+    from recce.extract import first_sentence
+
+    assert first_sentence('Summary line\n- a bullet, not an underline') == (
+        'Summary line - a bullet, not an underline'
+    )

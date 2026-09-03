@@ -248,3 +248,106 @@ def test_a_test_directory_on_its_own_still_maps(build):
     _, _, mapping, _ = build(files, '.')
     assert mapping.blocks
     assert all(b.title.startswith('test_t') for b in mapping.blocks)
+
+
+def test_blocks_sharing_a_basename_are_told_apart(build):
+    """Flask has `flask/app.py` and `flask/sansio/app.py`.
+
+    Two blocks both headed `app.py` ask the reader to guess which is which,
+    which is the one question a heading exists to answer.
+    """
+    body = (
+        '"""Module {}."""\n\n\ndef entry_{}(xs):\n    total = 0\n'
+        '    for x in xs:\n        if x:\n            total += x\n    return total\n'
+    )
+    _, _, mapping, _ = build(
+        {
+            'pkg/__init__.py': '',
+            'pkg/app.py': body.format('outer', 1),
+            'pkg/sansio/__init__.py': '',
+            'pkg/sansio/app.py': body.format('inner', 2),
+            'pkg/other.py': body.format('other', 3),
+        },
+        'pkg',
+    )
+    titles = [b.title for b in mapping.blocks]
+    assert len(titles) == len(set(titles)), titles
+    assert 'sansio/app.py' in titles
+
+
+def test_a_unique_basename_stays_short(build):
+    """Disambiguation is paid for only where it is needed."""
+    body = (
+        '"""Module {}."""\n\n\ndef entry_{}(xs):\n    total = 0\n'
+        '    for x in xs:\n        if x:\n            total += x\n    return total\n'
+    )
+    _, _, mapping, _ = build(
+        {
+            'pkg/__init__.py': '',
+            'pkg/alpha.py': body.format('a', 1),
+            'pkg/nested/__init__.py': '',
+            'pkg/nested/beta.py': body.format('b', 2),
+            'pkg/gamma.py': body.format('g', 3),
+        },
+        'pkg',
+    )
+    assert 'beta.py' in [b.title for b in mapping.blocks]
+
+
+def test_a_constructor_does_not_outrank_the_method_that_does_the_work(build):
+    """Found on `httpx`: two `__init__`s took the whole block budget.
+
+    Argument wrangling branches once per optional parameter, which counts the
+    same as branching once per real case and means something quite different.
+    """
+    files = {
+        'a.py': (
+            '"""P."""\n\n\nclass Client:\n'
+            '    def __init__(self, a=None, b=None, c=None, d=None):\n'
+            + ''.join(
+                '        self.{0} = {0} if {0} is not None else {1}\n'.format(name, i)
+                for i, name in enumerate('abcd')
+            )
+            + '\n    def send(self, request):\n'
+            '        for attempt in range(3):\n'
+            '            if not request:\n'
+            '                continue\n'
+            '            return request\n'
+            '        return None\n'
+        )
+    }
+    project, _, _, _ = build(files, 'a.py')
+    scores = {f.qualname: f.score for f in project.funcs()}
+    assert scores['Client.send'] > scores['Client.__init__'], scores
+
+
+def test_the_best_function_is_shown_even_when_something_calls_it(build):
+    """Uncalled is what makes a way in; it is not what makes something worth reading.
+
+    In a class-heavy module the two come apart: everything with callers is
+    disqualified as a root, leaving constructors and thin wrappers, while the
+    real work sits one level down. httpx's `_client.py` led with two
+    `__init__`s and never showed `Client.send`.
+    """
+    files = {
+        'pkg/__init__.py': '',
+        'pkg/a.py': (
+            '"""P."""\n\n\nclass Client:\n'
+            '    def __init__(self, a=None):\n        self.a = a\n        self.b = 1\n\n'
+            '    def get(self, url):\n        return self.send(url)\n\n'
+            '    def send(self, url):\n'
+            '        for attempt in range(3):\n'
+            '            if not url:\n                raise ValueError(url)\n'
+            '            if attempt > 1:\n                break\n'
+            '            for part in url:\n'
+            '                if part:\n                    url = part\n'
+            '        return url\n'
+        ),
+        'pkg/b.py': '"""Q."""\n\n\ndef beta(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+        'pkg/c.py': '"""R."""\n\n\ndef gamma(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+    }
+    _, _, mapping, _ = build(files, 'pkg')
+    block = next(b for b in mapping.blocks if b.title == 'a.py')
+    assert block.roots[0].func.qualname == 'Client.send', [
+        r.func.qualname for r in block.roots
+    ]
