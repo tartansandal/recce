@@ -70,7 +70,7 @@ sends you somewhere the code never goes. So it does not see:
 - anything registered by a decorator it does not recognise as an entry point
 - methods inherited from a base class outside the project
 - functions defined inside an `if` or `try` body: a platform branch or an
-  `ImportError` fallback is invisible, so calls to it resolve to nothing
+  `ImportError` fallback is invisible, so calls to them resolve to nothing
 - non-Python code, and any syntax newer than the interpreter running recce
 
 That last one is worth being precise about, because it is not what people
