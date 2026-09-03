@@ -259,3 +259,26 @@ def test_bare_model_flag_asks_for_a_pick():
 
     assert build_parser().parse_args(['x', '--model']).model == notes.AUTO
     assert build_parser().parse_args(['x', '--model', 'm:1b']).model == 'm:1b'
+
+
+def test_a_branch_claimed_where_none_exists_is_dropped():
+    """Grounding the prompt moved the lie from loops to branches."""
+    claim = 'dispatches on the node type it was handed'
+    assert notes.why_rejected(claim, n_loops=0, n_branches=0) == 'invented a branch'
+    assert notes.clean(claim, n_loops=0, n_branches=0) is None
+
+
+def test_a_branch_claim_survives_when_the_function_branches():
+    note = notes.clean(
+        'dispatches on `bound == owner`, then on the attr', n_loops=0, n_branches=4
+    )
+    assert note == 'dispatches on `bound == owner`, then on the attr'
+
+
+def test_the_shape_line_forbids_loops_only_when_there_are_none():
+    straight = make(loops=0, branches=6)
+    looping = make(loops=2, branches=4)
+    assert 'NO loops' in notes.shape_of(straight)
+    assert '6 branch' in notes.shape_of(straight)
+    assert 'NO loops' not in notes.shape_of(looping)
+    assert '2 loop' in notes.shape_of(looping)

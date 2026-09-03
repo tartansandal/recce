@@ -95,23 +95,35 @@ _LOOP_CLAIM = re.compile(
     re.IGNORECASE,
 )
 
+# The same trade in the other direction. Telling the model a function has no
+# loops moved it from claiming loops to claiming branches, so the claim worth
+# checking moved with it: a straight-line function that "dispatches on node
+# type" is the same falsehood wearing different words.
+_BRANCH_CLAIM = re.compile(
+    r'\b(?:branch\w*|dispatch\w*|decides?|chooses?|switch\w*|'
+    r'depending\s+on|either\b)',
+    re.IGNORECASE,
+)
+
 # Asking about every function is slow and pointless — most rows are plumbing.
 DEFAULT_LIMIT = 12
 
 PROMPT = """\
 Describe the control flow of this Python function in ONE short line.
 
-Say what it loops over and what its branches decide. Name the condition that
-ends a loop or returns early, if there is one. If it recurses or dispatches
-rather than looping, say that instead — do not call it a loop. Do not describe
-the signature, do not restate the name, do not explain why. Under {limit}
-characters. No Markdown, no quotes, no trailing full stop.
+{shape}
+
+Say what its branches decide and in what order. Name the condition that ends a
+loop or returns early, if there is one. Do not describe the signature, do not
+restate the name, do not explain why, do not count anything back to me. Under
+{limit} characters. No Markdown, no quotes, no trailing full stop.
 
 Examples of the register wanted:
     loop over records, bucket by status class, accumulate byte total
     returns early when the cache is warm, otherwise rebuilds and writes it
     walk up until a directory has no __init__.py, then stop
     dispatches on node type; recurses on the nested ones
+    tries imports, then module names, then the class MRO; drops what is left
 
 Function:
 ```python
@@ -211,7 +223,9 @@ def _key(model: str, source: str) -> str:
     return '{}:{}:{}:{}'.format(model, MAX_NOTE_CHARS, _PROMPT_DIGEST, source_digest)
 
 
-def why_rejected(raw: str, n_loops: Optional[int] = None) -> Optional[str]:
+def why_rejected(
+    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+) -> Optional[str]:
     """Name the rule a response broke, or None if it passed.
 
     Split out from `clean` so the CLI can say *which* rule is doing the
@@ -227,6 +241,8 @@ def why_rejected(raw: str, n_loops: Optional[int] = None) -> Optional[str]:
         return 'too short'
     if n_loops == 0 and _LOOP_CLAIM.search(text):
         return 'invented a loop'
+    if n_branches == 0 and _BRANCH_CLAIM.search(text):
+        return 'invented a branch'
     return None
 
 
@@ -274,7 +290,9 @@ def _trim(text: str) -> str:
     return ', '.join(kept)
 
 
-def clean(raw: str, n_loops: Optional[int] = None) -> Optional[str]:
+def clean(
+    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+) -> Optional[str]:
     """Reduce a model response to a usable note, or reject it.
 
     Rejection is the common case worth designing for. Anything that arrives
@@ -293,7 +311,7 @@ def clean(raw: str, n_loops: Optional[int] = None) -> Optional[str]:
     there. A reader has no way to catch that from the map alone, which is
     exactly why the map must catch it for them.
     """
-    if why_rejected(raw, n_loops) is not None:
+    if why_rejected(raw, n_loops, n_branches) is not None:
         return None
     text = _trim(_reduce(raw))
     return text[0].lower() + text[1:] if text[:1].isupper() else text
@@ -338,17 +356,45 @@ def resolve_model(host: str = DEFAULT_HOST, timeout: float = 5.0) -> Optional[st
     return installed[0] if installed else None
 
 
-def _ask(host: str, model: str, source: str, timeout: float) -> Optional[str]:
+def shape_of(func: Func) -> str:
+    """The line of the prompt that tells the model what the tree already says.
+
+    The counts are here to forbid, not to be repeated: a 7B shown any function
+    reaches for "loops over", and on `graph.py` that was four rejections out of
+    seven, every one of them a dispatch chain with no loop in it. Saying so up
+    front is cheaper than rejecting the answer afterwards, and the rejection
+    stays where it is either way — this steers the model, it does not license
+    it.
+    """
+    if func.n_loops:
+        return (
+            'This function contains {} loop(s) and {} branch(es). '
+            'Say what it loops over.'.format(func.n_loops, func.n_branches)
+        )
+    return (
+        'This function contains NO loops. Do not write "loop", "loops", '
+        '"iterate" or "for each" — there is nothing to iterate. It has {} '
+        'branch(es); describe what they decide, or say what it dispatches '
+        'on, or what makes it return early.'.format(func.n_branches)
+    )
+
+
+def _ask(
+    host: str, model: str, source: str, timeout: float, shape: str = ''
+) -> Optional[str]:
     """One blocking call to Ollama's generate endpoint."""
     payload = json.dumps(
         {
             'model': model,
-            'prompt': PROMPT.format(source=source, limit=MAX_NOTE_CHARS),
+            'prompt': PROMPT.format(source=source, limit=MAX_NOTE_CHARS, shape=shape),
             'stream': False,
             'options': {
-                # Low temperature: this is description, not composition, and a
-                # map that changes wording between runs is a map nobody trusts.
-                'temperature': 0.1,
+                # Zero, not merely low: this is description, not composition,
+                # and a map that changes wording between runs is a map nobody
+                # trusts. At 0.1 three uncached runs of `graph.py` disagreed
+                # about four notes and about whether one function got one at
+                # all; at 0 they are byte-identical.
+                'temperature': 0.0,
                 'num_predict': 60,
             },
         }
@@ -397,19 +443,21 @@ def fill(
             report.cached += 1
             continue
         try:
-            raw = _ask(host, model, source, timeout)
+            raw = _ask(host, model, source, timeout, shape_of(func))
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
             # One failure means the server is gone or the model is not pulled.
             # Both make every remaining call fail the same way, so stop rather
             # than wait out the timeout once per function.
             report.error = str(getattr(exc, 'reason', None) or exc)
             break
-        reason = why_rejected(raw or '', n_loops=func.n_loops)
+        reason = why_rejected(
+            raw or '', n_loops=func.n_loops, n_branches=func.n_branches
+        )
         if reason is not None:
             report.rejected += 1
             report.reasons[reason] = report.reasons.get(reason, 0) + 1
             continue
-        note = clean(raw or '', n_loops=func.n_loops)
+        note = clean(raw or '', n_loops=func.n_loops, n_branches=func.n_branches)
         func.note = note
         report.filled += 1
         if use_cache:
