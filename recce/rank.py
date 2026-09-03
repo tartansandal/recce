@@ -636,13 +636,10 @@ def _fit(
         ]
         if sum(n.line_count() for n in attempt) <= max_lines:
             return attempt
-    # Genuinely the last rung, and free once the trees exist: roots are already
-    # in score order, so the prefix that fits drops the least interesting flows
-    # without rebuilding anything. Rebuilding once per root count is what made
-    # this quadratic, and on a package the size of asyncio it cost twenty-odd
-    # seconds. Inside the loop this fired at the first rung instead, so a block
-    # lost whole flows — `discover()` and everything under it — while still
-    # paying full price for notes and deep leaves.
+    # Free once the trees exist: roots are already in score order, so the
+    # prefix that fits drops the least interesting flows without rebuilding
+    # anything. Rebuilding once per root count is what made this quadratic, and
+    # on a package the size of asyncio it cost twenty-odd seconds.
     trimmed = _prefix_within(attempt, max_lines)
     if trimmed:
         return trimmed
