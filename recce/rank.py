@@ -51,22 +51,21 @@ _ENTRY_DECORATORS = (
 # read there would be a wrong turn.
 _NON_ENTRY_DECORATORS = ('fixture', 'property', 'cached_property', 'setter', 'deleter')
 
-# The pruning ladder, tried in order until the map fits its budget. The
-# priority lives in `_CONCESSION_ORDER` below rather than in the nesting of
-# loops, so the order of concessions is something you can read and argue with,
-# which is the whole point of it.
+# The depth caps tried in turn, deepest first.
+_DEPTH_LADDER = (6, 5, 4, 3)
+
+# The pruning ladder: what recce gives up to fit its budget, cheapest
+# concession first. The priority lives here rather than in the nesting of
+# loops, so it is something you can read and argue with — reorder these four
+# lines and you have changed what recce sacrifices.
 #
 # The order says what recce believes is worth least. Notes go before rows,
 # because a row the reader cannot see is a call they will not know about,
 # while a missing note only costs them a sentence they can get by opening the
 # file. Then externals, then depth for the same reason — a reader four levels
-# down has already left the flow the map is describing — and a whole flow is
-# given up only when nothing cheaper is left.
-_DEPTH_LADDER = (6, 5, 4, 3)
-
-# Cheapest concession first: the first entry is the first thing given up.
-# Reordering these four lines is how you change what recce sacrifices, and it
-# is meant to be read as a claim about what a reader can least afford to lose.
+# down has already left the flow the map is describing. Giving up a whole flow
+# is dearer than any of them and is not on this list: `_fit` does that only
+# once every rung here is spent.
 _CONCESSION_ORDER = (
     ('notes', ('all', 'spine', 'none')),
     ('external_depth', (99, 2)),
@@ -76,10 +75,10 @@ _CONCESSION_ORDER = (
 
 
 def _rungs():
-    """Budget concessions, cheapest first.
+    """Every combination of `_CONCESSION_ORDER`, cheapest concession first.
 
-    The first entry of `_CONCESSION_ORDER` varies fastest, so every cheaper
-    combination is tried before a dearer one is touched at all.
+    Its first entry varies fastest, so every cheaper combination is tried
+    before a dearer one is touched at all.
     """
     names = [name for name, _ in _CONCESSION_ORDER]
     grids = [values for _, values in _CONCESSION_ORDER]
@@ -613,23 +612,16 @@ def _fit(
 ) -> List[Node]:
     """Expand roots into trees, pruning down a ladder until they fit.
 
-    The rungs go from cheapest concession to dearest, so a map only pays for
-    the constraint it actually hits:
+    The rungs are the product of `_CONCESSION_ORDER`, cheapest concession
+    first, so a map only pays for the constraint it actually hits. Each rung
+    re-runs the cheaper ones beneath it, which is why four dimensions come to
+    48 rungs rather than four steps.
 
-    1. keep everything
-    2. drop notes, which cost a line each and say what opening the file says
-    3. hide externals below the second level, keeping the surface visible at
-       the top where it says what the module talks to
-    4. cap the depth, progressively — deep rows are the least useful, since a
-       reader four levels down has left the flow the map is describing
-    5. drop skimmable leaves, which by definition hold no branching
+    Only when every one is spent does the map show fewer flows, by keeping the
+    prefix of root trees that fits. Dropping a whole flow is dearer than
+    anything on the ladder, so it is genuinely last.
 
-    Each rung re-runs the cheaper ones beneath it, so those four dimensions are
-    48 rungs rather than four steps. Only when every one is spent does the map
-    show fewer flows, by keeping the prefix of root trees that fits — dropping
-    a whole flow is the dearest thing here, so it is genuinely last.
-
-    Something always comes back. If even one root over budget, that is what
+    Something always comes back. If even one root is over budget, that is what
     ships, because a map that is four lines too long is a worse failure than
     no map at all only in a spec.
     """
@@ -671,10 +663,8 @@ def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
 def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     """Build the whole map structure, splitting if it will not fit.
 
-    The ladder is: full tree, then drop notes, then hide externals below the
-    second level, then cap the depth progressively, then drop skimmable leaves,
-    and only then show fewer flows. Whatever comes out of the bottom of that
-    still over budget gets split instead — one block
+    Whatever comes out of the bottom of `_fit`'s ladder still over budget gets
+    split instead — one block
     per module when there is more than one, otherwise one block per entry
     point.
     """
