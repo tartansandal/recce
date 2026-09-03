@@ -438,11 +438,8 @@ def _dedupe_definitions(funcs: List[Func]) -> List[Func]:
         if previous is None:
             ordered[func.qualname] = func
             continue
-        # The getter wins a `@property` pair outright — both share a name, and
-        # the getter is the one that says what the attribute is, however short
-        # its body. Otherwise the definition with the most in it wins. Ties go
-        # to the later definition, matching what Python itself would leave
-        # bound. The loser's calls move across rather than dying with it.
+        # Ties go to the later definition, matching what Python itself would
+        # leave bound, and the loser's calls move across rather than dying.
         if _definition_rank(func) >= _definition_rank(previous):
             winner, loser = func, previous
         else:
