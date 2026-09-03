@@ -30,7 +30,7 @@ import re
 import tokenize
 import tomllib
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from .model import Call, Class, Constant, Func, Module, Project
 
@@ -265,15 +265,26 @@ def _dotted_of(node: ast.AST) -> Tuple[Optional[str], str, str]:
     return None, (parts[-1] if parts else dotted), dotted
 
 
-def _body_metrics(
-    body: Iterable[ast.stmt],
-) -> Tuple[int, int, List[Call], List[str], int]:
+class _BodyMetrics(NamedTuple):
+    """What one walk of a function body measures."""
+
+    n_stmts: int
+    n_branches: int
+    n_loops: int
+    n_ternaries: int
+    calls: List[Call]
+    returns_keys: List[str]
+    n_strings: int
+
+
+def _body_metrics(body: Iterable[ast.stmt]) -> _BodyMetrics:
     """Measure a function body in one walk.
 
-    Returns the statement count, the branch count, the call sites, the keys of
-    any dict literal the body returns, and a count of string literals.
+    The fields are named in `_BodyMetrics`. The enumeration that used to stand
+    here fell two behind what the function returns, which is what a positional
+    tuple lets happen.
 
-    The last of those is the least obvious and the most useful. A function
+    The string count is the least obvious and the most useful. A function
     thick with string literals is almost always building output, and output
     builders branch as much as real logic does — a report writer looping over
     its sections looks exactly like an aggregator looping over records if all
@@ -321,7 +332,9 @@ def _body_metrics(
     # than source order. The map reads top to bottom the way the function does,
     # which means the line number is what orders the children.
     calls.sort(key=lambda c: c.lineno)
-    return n_stmts, n_branches, n_loops, n_ternaries, calls, returns_keys, n_strings
+    return _BodyMetrics(
+        n_stmts, n_branches, n_loops, n_ternaries, calls, returns_keys, n_strings
+    )
 
 
 def _is_prose_string(node: ast.AST) -> bool:
@@ -742,7 +755,7 @@ def extract_module(
                         )
                     )
         elif isinstance(node, ast.If) and _is_main_guard(node):
-            module.main_calls = _body_metrics(node.body)[4]
+            module.main_calls = _body_metrics(node.body).calls
 
     module.funcs = _dedupe_definitions(module.funcs)
     # `methods` is collected while walking the class body, before the dedupe
