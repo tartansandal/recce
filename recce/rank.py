@@ -177,13 +177,15 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
     # given, so checking the declared ways in before the graph-shape fallback
     # is what makes a decorated entry point outrank its own lack of callers.
     for func in by_id.values():
-        decorators = func.decorator_tails
-        if any(d in _NON_ENTRY_DECORATORS for d in decorators):
+        tails = func.decorator_tails
+        if any(d in _NON_ENTRY_DECORATORS for d in tails):
             continue
-        if any(d in _ENTRY_DECORATORS for d in decorators):
+        if any(d in _ENTRY_DECORATORS for d in tails):
             offer(func, 2)
-        elif func.name == 'main' and not func.is_method:
+            continue
+        if func.name == 'main' and not func.is_method:
             offer(func, 3)
+            continue
         if func.fan_in or not func.is_public or func.name.startswith('test_'):
             continue
         # A method with no callers is only a way in if the class is a real
