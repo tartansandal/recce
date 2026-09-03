@@ -59,8 +59,9 @@ _NON_ENTRY_DECORATORS = ('fixture', 'property', 'cached_property', 'setter', 'de
 # The order says what recce believes is worth least. Notes go before rows,
 # because a row the reader cannot see is a call they will not know about,
 # while a missing note only costs them a sentence they can get by opening the
-# file. Depth goes before breadth for the same reason: a reader four levels
-# down has already left the flow the map is describing.
+# file. Then externals, then depth for the same reason — a reader four levels
+# down has already left the flow the map is describing — and a whole flow is
+# given up only when nothing cheaper is left.
 _DEPTH_LADDER = (6, 5, 4, 3)
 
 # Cheapest concession first: the first entry is the first thing given up.
@@ -617,12 +618,17 @@ def _fit(
     the constraint it actually hits:
 
     1. keep everything
-    2. drop skimmable leaves, which by definition hold no branching
-    3. cap the depth, progressively — deep rows are the least useful, since a
-       reader four levels down has left the flow the map is describing
-    4. hide externals below the second level, keeping the surface visible at
+    2. drop notes, which cost a line each and say what opening the file says
+    3. hide externals below the second level, keeping the surface visible at
        the top where it says what the module talks to
-    5. drop the lowest-scoring root trees entirely
+    4. cap the depth, progressively — deep rows are the least useful, since a
+       reader four levels down has left the flow the map is describing
+    5. drop skimmable leaves, which by definition hold no branching
+
+    Each rung re-runs the cheaper ones beneath it, so those four dimensions are
+    48 rungs rather than four steps. Only when every one is spent does the map
+    show fewer flows, by keeping the prefix of root trees that fits — dropping
+    a whole flow is the dearest thing here, so it is genuinely last.
 
     Something always comes back. If even one root over budget, that is what
     ships, because a map that is four lines too long is a worse failure than
@@ -637,14 +643,16 @@ def _fit(
         ]
         if sum(n.line_count() for n in attempt) <= max_lines:
             return attempt
-        # The last rung is free once the trees exist: roots are already in
-        # score order, so taking the prefix that fits drops the least
-        # interesting flows without rebuilding anything. Rebuilding once per
-        # root count is what made this quadratic, and on a package the size of
-        # asyncio it cost twenty-odd seconds.
-        trimmed = _prefix_within(attempt, max_lines)
-        if trimmed:
-            return trimmed
+    # Genuinely the last rung, and free once the trees exist: roots are already
+    # in score order, so the prefix that fits drops the least interesting flows
+    # without rebuilding anything. Rebuilding once per root count is what made
+    # this quadratic, and on a package the size of asyncio it cost twenty-odd
+    # seconds. Inside the loop this fired at the first rung instead, so a block
+    # lost whole flows — `discover()` and everything under it — while still
+    # paying full price for notes and deep leaves.
+    trimmed = _prefix_within(attempt, max_lines)
+    if trimmed:
+        return trimmed
     return attempt[:1]
 
 
@@ -664,9 +672,10 @@ def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
 def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     """Build the whole map structure, splitting if it will not fit.
 
-    The ladder is: full tree, then drop skimmable leaves, then cap the depth
-    progressively, then hide externals below the second level. Whatever comes
-    out of the bottom of that still over budget gets split instead — one block
+    The ladder is: full tree, then drop notes, then hide externals below the
+    second level, then cap the depth progressively, then drop skimmable leaves,
+    and only then show fewer flows. Whatever comes out of the bottom of that
+    still over budget gets split instead — one block
     per module when there is more than one, otherwise one block per entry
     point.
     """
