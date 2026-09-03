@@ -40,9 +40,10 @@ because breaking it makes the map actively misleading rather than merely worse.
   describes the project the package sits in, but a manifest above a package
   describes that package.
 - **The line budget is real.** A map that quietly runs to three screens has
-  failed at its only job. `_rungs()` in `rank.py` spells out the order of
-  concessions; it is written as a list rather than nested loops so the priority
-  is something you can read and argue with. Notes go before rows, because a
+  failed at its only job. `_CONCESSION_ORDER` in `rank.py` spells out the
+  order of concessions as a list rather than burying it in the nesting of
+  loops, so the priority is something you can read and argue with — reorder
+  those lines and you have changed what recce gives up first. Notes go before rows, because a
   hidden row is a call the reader never learns about while a dropped note only
   costs a sentence they can get by opening the file.
 - **Model output is checked against the syntax tree.** `notes.py` knows from
