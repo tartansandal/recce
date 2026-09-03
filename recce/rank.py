@@ -174,19 +174,18 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
         for target in graph.entry_calls.get(module.name, []):
             offer(by_id.get(target), 1)
 
-    for func in project.funcs():
-        decorators = [d.split('.')[-1] for d in func.decorators]
+    # One pass, in rank order: `offer` keeps the first rank a function is
+    # given, so checking the declared ways in before the graph-shape fallback
+    # is what makes a decorated entry point outrank its own lack of callers.
+    for func in by_id.values():
+        decorators = func.decorator_tails
         if any(d in _NON_ENTRY_DECORATORS for d in decorators):
             continue
         if any(d in _ENTRY_DECORATORS for d in decorators):
             offer(func, 2)
         elif func.name == 'main' and not func.is_method:
             offer(func, 3)
-
-    for func in project.funcs():
         if func.fan_in or not func.is_public or func.name.startswith('test_'):
-            continue
-        if any(d.split('.')[-1] in _NON_ENTRY_DECORATORS for d in func.decorators):
             continue
         # A method with no callers is only a way in if the class is a real
         # object rather than a record; a dataclass field accessor is not.
