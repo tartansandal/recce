@@ -266,22 +266,41 @@ def test_overload_stubs_lose_to_the_implementation(build):
 
 
 def test_every_function_has_a_distinct_node_id(build):
-    """A duplicate id makes the index and the render disagree about what exists."""
+    """A duplicate id makes the index and the render disagree about what exists.
+
+    All three duplications are written at module scope on purpose: a def
+    inside an `if` or a `try` is not extracted at all, so a fixture that hides
+    them there asserts over one function and passes whatever dedupe does.
+
+    The ids come from `module.funcs`, the list the renderer walks, and not
+    from `project.funcs()`. The latter is `by_id().values()`, a dict keyed on
+    node_id, so asking it for duplicate ids is a tautology that passes with
+    dedupe deleted outright.
+    """
     project, _, _, _ = build(
         {
             'a.py': (
-                '"""P."""\n\nimport sys\n\n\n'
-                'if sys.platform == "win32":\n'
-                '    def go():\n        return 1\n'
-                'else:\n'
-                '    def go():\n        return 2\n\n\n'
+                '"""P."""\n\nfrom typing import overload\n\n\n'
+                'def go():\n    return 1\n\n\n'
+                'def go():\n    return 2\n\n\n'
+                '@overload\ndef parse(x: int) -> int: ...\n'
+                '@overload\ndef parse(x: str) -> str: ...\n'
+                'def parse(x):\n    return x\n\n\n'
+                'class C:\n'
+                '    @property\n    def enc(self):\n        return self._enc\n\n'
+                '    @enc.setter\n    def enc(self, value):\n'
+                '        self._enc = value\n\n'
+                '    @enc.deleter\n    def enc(self):\n        del self._enc\n\n\n'
                 'def other():\n    return go()\n'
             )
         },
         'a.py',
     )
-    ids = [f.node_id for f in project.funcs()]
+    walked = [f for m in project.modules.values() for f in m.funcs]
+    ids = [f.node_id for f in walked]
     assert len(ids) == len(set(ids)), ids
+    # Positive, so the test cannot quietly go back to asserting over nothing.
+    assert sorted(f.qualname for f in walked) == ['C.enc', 'go', 'other', 'parse']
 
 
 def test_a_class_lists_the_methods_that_survived_dedupe(build):
