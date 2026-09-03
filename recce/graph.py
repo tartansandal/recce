@@ -21,12 +21,25 @@ What survives the pass is a classification on every `Call`:
 from __future__ import annotations
 
 import builtins
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
 from .model import EXTERNAL, PROJECT, Call, Class, Func, Project
 
 _BUILTINS = frozenset(dir(builtins))
+
+# Every top-level module the standard library ships, from 3.10 on. Used to
+# rank, never to hide: a call into `pathlib` and a call into `pydub` are both
+# external surface and both get a bracket. But when the budget forces externals
+# out of a tree, the third-party ones are the ones worth keeping — they say
+# what this code depends on, where `os` and `sys` say only that it is Python.
+_STDLIB = frozenset(sys.stdlib_module_names)
+
+
+def is_stdlib(label: str) -> bool:
+    return label.split('.')[0] in _STDLIB
+
 
 # Names that are almost always plumbing rather than a destination. They pass
 # the import test and would otherwise fill the map with rows nobody navigates

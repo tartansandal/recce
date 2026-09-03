@@ -130,3 +130,26 @@ def test_scalars_return_when_there_is_nothing_better(build):
         'a.py',
     )
     assert '- `HOST` — str' in text
+
+
+def test_a_map_says_so_when_files_would_not_parse(build):
+    """The warning went to stderr, where a saved map cannot carry it.
+
+    A map of a package where a third of the files failed still looks like a
+    map, and nothing in the document admits what is missing.
+    """
+    _, _, _, text = build(
+        {
+            'good.py': '"""P."""\n\n\ndef go(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+            'bad.py': 'def (:\n',
+        },
+        '.',
+    )
+    assert 'Incomplete' in text
+    assert 'bad.py' in text
+    assert '1 of 2 files' in text
+
+
+def test_a_clean_map_carries_no_warning(build):
+    _, _, _, text = build({'a.py': '"""P."""\n\n\ndef go():\n    pass\n'}, 'a.py')
+    assert 'Incomplete' not in text

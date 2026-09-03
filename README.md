@@ -25,8 +25,8 @@ main(argv)  ★
 
 ## Running it
 
-recce is stdlib-only and imports nothing you have to install, so the zero-install
-path is the real one:
+recce needs Python 3.11 or newer and imports nothing you have to install, so
+the zero-install path is the real one:
 
 ```sh
 python3 -m recce path/to/package          # copy the recce/ directory anywhere
@@ -69,9 +69,14 @@ sends you somewhere the code never goes. So it does not see:
 - methods called on objects whose type is not written down
 - anything registered by a decorator it does not recognise as an entry point
 - methods inherited from a base class outside the project
-- non-Python code, and Python that a 3.9 `ast` cannot parse — mapping a
-  codebase that uses `match` needs a newer interpreter to run recce, even
-  though recce itself stays 3.9-compatible
+- non-Python code, and any syntax newer than the interpreter running recce
+
+That last one is worth being precise about, because it is not what people
+expect. What recce can *read* is decided by the interpreter it runs on, not by
+`requires-python` — run it on 3.11 and `match`, `except*` and PEP 695 generics
+are all unreadable; run the same code on 3.14 and they are fine. **Run recce on
+the newest Python you have**, whatever it was built against. When files do fail
+to parse the map says so at the top rather than quietly leaving them out.
 
 The purpose line has a rule of its own. It comes from the module docstring, a
 README in that exact directory, or a top-of-file comment block — and from
@@ -87,6 +92,7 @@ Four passes, each reading only what the one before it wrote:
 | extract | `extract.py` | parse sources with `ast` into plain records |
 | graph | `graph.py` | resolve call sites to targets, or drop them |
 | rank | `rank.py` | score, classify, prune to budget, split if needed |
+| notes | `notes.py` | optional; ask a local model for branch-shape lines |
 | render | `render.py` | format as markdown |
 
 `rank.py` is where the arguing is worth doing. It decides what counts as a
@@ -154,12 +160,27 @@ as true as it was, which cutting mid-sentence would not. And a bland note is
 worse than no note, since it costs a line to say nothing, which is what the
 minimum length is defending against.
 
+## Entry points
+
+recce looks for the way in, best evidence first: `[project.scripts]` in a
+`pyproject.toml` above the tree, then a `__main__` guard, then a framework
+decorator it recognises, then a function called `main`, and only then the shape
+of the call graph. The first of those is a declaration and the rest are
+inference, which is why it wins — though a console script that is a two-line
+shim is followed rather than starred.
+
 ## Tests
 
 ```sh
 uv sync
-uv run pytest -q
+./check          # ruff, then pytest on the 3.11 floor and again on 3.14
+uv run pytest -q # just the floor
 ```
+
+`./check` runs two interpreters on purpose. The floor catches syntax too new to
+compile; the ceiling catches `ast` API that has since been removed — `ast.Ellipsis`
+went in 3.12 and crashed on every codebase using `Callable[..., X]`, having
+passed the whole suite on the floor.
 
 `tests/test_skill_checklist.py` is the acceptance suite: it runs recce against
 the three fixtures shipped with the `code-map` skill and asserts that skill's

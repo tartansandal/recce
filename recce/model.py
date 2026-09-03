@@ -166,6 +166,9 @@ class Project:
     modules: Dict[str, Module] = field(default_factory=dict)
     root: Optional[str] = None
     readme: Optional[str] = None
+    # `module:function` targets from `[project.scripts]`, the one place a
+    # package states its entry points rather than leaving them to be inferred.
+    declared_entries: List[str] = field(default_factory=list)
 
     def funcs(self) -> List[Func]:
         return [f for m in self.modules.values() for f in m.funcs]

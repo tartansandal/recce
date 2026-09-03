@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .graph import Graph, external_display
+from .graph import Graph, external_display, is_stdlib
 from .model import EXTERNAL, KEEP, PROJECT, SKIM, SPINE, TRIVIAL, Func, Project
 
 # Decorators that mean "a framework calls this", so the function is a way in
@@ -156,18 +156,21 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
             seen.add(func.node_id)
             ranked.append((rank, func.node_id, func))
 
+    for declared in project.declared_entries:
+        offer(_resolve_declared(declared, project), 0)
+
     for module in project.modules.values():
         for target in graph.entry_calls.get(module.name, []):
-            offer(by_id.get(target), 0)
+            offer(by_id.get(target), 1)
 
     for func in project.funcs():
         decorators = [d.split('.')[-1] for d in func.decorators]
         if any(d in _NON_ENTRY_DECORATORS for d in decorators):
             continue
         if any(d in _ENTRY_DECORATORS for d in decorators):
-            offer(func, 1)
-        elif func.name == 'main' and not func.is_method:
             offer(func, 2)
+        elif func.name == 'main' and not func.is_method:
+            offer(func, 3)
 
     for func in project.funcs():
         if func.fan_in or not func.is_public or func.name.startswith('test_'):
@@ -176,10 +179,51 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
             continue
         # A method with no callers is only a way in if the class is a real
         # object rather than a record; a dataclass field accessor is not.
-        offer(func, 3 if not func.is_method else 4)
+        offer(func, 4 if not func.is_method else 5)
 
     ranked.sort(key=lambda item: (item[0], -item[2].n_branches, item[1]))
     return [func for _, _, func in ranked]
+
+
+def _resolve_declared(target: str, project: Project) -> Optional[Func]:
+    """Find the function a `module:function` console-script target names.
+
+    The module part is matched on a suffix, because `[project.scripts]` names
+    it from the distribution root while recce may have been pointed at the
+    package directory itself, giving the two different ideas of where names
+    start.
+    """
+    module_part, _, func_part = target.partition(':')
+    func_part = func_part.split('.')[0].strip() or 'main'
+    module_part = module_part.strip()
+    by_id = project.by_id()
+    exact = by_id.get('{}::{}'.format(module_part, func_part))
+    if exact is not None:
+        return exact
+
+    # A package usually re-exports its entry point: httpx declares
+    # `httpx:main`, and `main` lives in `httpx._main` with the package
+    # `__init__` importing it. The import table already records where the name
+    # came from, so the indirection costs one lookup.
+    owner = project.modules.get(module_part)
+    if owner is not None:
+        bound = owner.imports.get(func_part)
+        if bound:
+            real_module, _, real_name = bound.rpartition('.')
+            found = by_id.get('{}::{}'.format(real_module, real_name))
+            if found is not None:
+                return found
+
+    for name in project.modules:
+        if (
+            name == module_part
+            or module_part.endswith('.' + name)
+            or name.endswith('.' + module_part)
+        ):
+            found = by_id.get('{}::{}'.format(name, func_part))
+            if found is not None:
+                return found
+    return None
 
 
 def _assign_depth(funcs: Sequence[Func], graph: Graph, entries: Sequence[Func]) -> None:
@@ -346,11 +390,13 @@ def _assign_roles(funcs: Sequence[Func], graph: Graph, entries: Sequence[Func]) 
             ):
                 func.role = SKIM
 
-    for func in _pick_spine(funcs, entries):
+    for func in _pick_spine(funcs, entries, graph):
         func.role = SPINE
 
 
-def _pick_spine(funcs: Sequence[Func], entries: Sequence[Func]) -> List[Func]:
+def _pick_spine(
+    funcs: Sequence[Func], entries: Sequence[Func], graph: Graph
+) -> List[Func]:
     """Choose the one to three functions to star.
 
     The first entry point is always one of them: it is where the reader starts
@@ -360,8 +406,15 @@ def _pick_spine(funcs: Sequence[Func], entries: Sequence[Func]) -> List[Func]:
     than starring nothing.
     """
     chosen: List[Func] = []
-    if entries:
-        chosen.append(entries[0])
+    # The first entry point is where execution starts, which is not always
+    # where reading should. A console script is very often a two-line shim —
+    # flask declares `flask.cli:main`, whose whole body is `cli.main()` — and
+    # starring it points the reader at a forwarding address. When the way in
+    # has nothing in it, the star goes to something that does.
+    for entry in entries[:2]:
+        if not _is_trivial(entry, graph):
+            chosen.append(entry)
+            break
     reachable = [
         f
         for f in funcs
@@ -489,7 +542,11 @@ def _build_tree(
                 label = '{}()'.format(call.label)
                 if not any(c.label == label for c in node.children):
                     node.children.append(Node(label=label))
-            elif call.kind == EXTERNAL and call.label and depth < external_depth:
+            elif (
+                call.kind == EXTERNAL
+                and call.label
+                and depth < _external_cutoff(call.label, external_depth)
+            ):
                 display = '{}()'.format(external_display(call))
                 if not any(c.label == display and c.bracket for c in node.children):
                     node.children.append(Node(label=display, bracket=call.label))
@@ -504,6 +561,20 @@ def _build_tree(
         return node
 
     return expand(root, 0, set())
+
+
+def _external_cutoff(label: str, external_depth: int) -> int:
+    """How deep a bracket of this kind is allowed to go.
+
+    When the budget starts pushing externals out of the tree, the standard
+    library goes first. `os.path.join` at depth three tells a reader nothing
+    they did not already assume; `boto3.client` at the same depth tells them
+    what this code talks to, which is one of the questions the map exists to
+    answer.
+    """
+    if external_depth >= 99 or not is_stdlib(label):
+        return external_depth + 2
+    return external_depth
 
 
 def _note_for(func: Func, mode: str) -> Optional[str]:

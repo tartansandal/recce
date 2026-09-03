@@ -351,3 +351,40 @@ def test_the_best_function_is_shown_even_when_something_calls_it(build):
     assert block.roots[0].func.qualname == 'Client.send', [
         r.func.qualname for r in block.roots
     ]
+
+
+def test_a_declared_entry_point_outranks_every_inference(build):
+    from recce.rank import _resolve_declared
+
+    files = {
+        'pyproject.toml': "[project]\nname='x'\n\n[project.scripts]\nx='pkg.cli:run'\n",
+        'pkg/__init__.py': '',
+        'pkg/cli.py': '"""Entry."""\n\n\ndef run(xs):\n    total = 0\n    for x in xs:\n        if x:\n            total += x\n    return total\n',
+        'pkg/other.py': '"""Other."""\n\n\ndef helper(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+        'pkg/third.py': '"""Third."""\n\n\ndef more(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+    }
+    project, _, mapping, _ = build(files, 'pkg')
+    assert project.declared_entries == ['pkg.cli:run']
+    assert _resolve_declared('pkg.cli:run', project).node_id == 'pkg.cli::run'
+    assert mapping.entries[0].node_id == 'pkg.cli::run'
+
+
+def test_a_shim_entry_point_does_not_lead_the_spine(build):
+    """flask declares `flask.cli:main`, whose whole body is `cli.main()`.
+
+    "Spine to read first" pointing at a forwarding address sends the reader to
+    the wrong file. The shim can still be starred inside its own block, where
+    it is the only thing there and the star means "this is all of it".
+    """
+    files = {
+        'pyproject.toml': "[project]\nname='x'\n\n[project.scripts]\nx='pkg.cli:main'\n",
+        'pkg/__init__.py': '',
+        'pkg/cli.py': '"""Entry."""\n\nimport click\n\n\ndef main():\n    click.main()\n',
+        'pkg/work.py': '"""Work."""\n\n\ndef process(xs):\n    total = 0\n    for x in xs:\n        if x > 1:\n            total += x\n        elif x:\n            total -= x\n    return total\n',
+        'pkg/third.py': '"""Third."""\n\n\ndef more(xs):\n    for x in xs:\n        if x:\n            return x\n    return None\n',
+    }
+    project, _, mapping, _ = build(files, 'pkg')
+    assert mapping.entries[0].node_id == 'pkg.cli::main'
+    spine = [f.node_id for f in mapping.spine]
+    assert 'pkg.cli::main' not in spine, spine
+    assert spine[0] == 'pkg.work::process'

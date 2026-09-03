@@ -154,3 +154,60 @@ def test_an_underline_needs_to_be_one_repeated_mark():
     assert first_sentence('Summary line\n- a bullet, not an underline') == (
         'Summary line - a bullet, not an underline'
     )
+
+
+def test_console_scripts_are_read_from_pyproject(build, tmp_path):
+    """The one place a package states its entry points instead of implying them."""
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'pyproject.toml').write_text(
+        "[project]\nname = 'x'\n\n[project.scripts]\nx = 'pkg.cli:main'\n"
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_a_pyproject_above_a_src_layout_is_still_found(tmp_path):
+    """flask's manifest sits two levels above `src/flask`."""
+    from recce.extract import declared_entry_points
+
+    (tmp_path / '.git').mkdir()
+    (tmp_path / 'pyproject.toml').write_text(
+        "[project]\nname = 'x'\n\n[project.scripts]\nx = 'pkg.cli:main'\n"
+    )
+    deep = tmp_path / 'src' / 'pkg'
+    deep.mkdir(parents=True)
+    assert declared_entry_points(deep) == ['pkg.cli:main']
+
+
+def test_a_broken_pyproject_costs_nothing(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'pyproject.toml').write_text('[project\nbroken = ')
+    assert declared_entry_points(tmp_path) == []
+
+
+def test_imports_inside_type_checking_are_recorded(build):
+    """httpx binds its entry point this way, and nothing else names its home."""
+    project, _, _, _ = build(
+        {
+            'pkg/__init__.py': 'import typing\n\nif typing.TYPE_CHECKING:\n    from ._main import main\n',
+            'pkg/_main.py': 'def main():\n    return 1\n',
+        },
+        'pkg',
+    )
+    assert project.modules['pkg'].imports.get('main') == 'pkg._main.main'
+
+
+def test_imports_in_a_try_except_fallback_are_recorded(build):
+    project, _, _, _ = build(
+        {
+            'pkg/__init__.py': 'try:\n    from .fast import go\nexcept ImportError:\n    from .slow import go\n',
+            'pkg/fast.py': 'def go():\n    return 1\n',
+            'pkg/slow.py': 'def go():\n    return 0\n',
+        },
+        'pkg',
+    )
+    assert project.modules['pkg'].imports.get('go') in (
+        'pkg.fast.go',
+        'pkg.slow.go',
+    )

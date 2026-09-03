@@ -28,6 +28,7 @@ import builtins
 import os
 import re
 import tokenize
+import tomllib
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -36,6 +37,10 @@ from .model import Call, Class, Constant, Func, Module, Project
 # Directories that are never someone's source tree, skipped on the walk. Test
 # directories are deliberately absent: a test suite is often the best available
 # description of what the code is for, and the caller can exclude it if not.
+# How far up to look for a `pyproject.toml` before giving up. Four covers the
+# src layout (`repo/src/pkg/sub` -> `repo`) with a level to spare.
+_PYPROJECT_SEARCH_LEVELS = 4
+
 SKIP_DIRS = frozenset(
     {
         '.git',
@@ -477,10 +482,41 @@ def _resolve_relative(
     return '.'.join(p for p in base if p)
 
 
+def _import_statements(body: Iterable[ast.stmt]) -> Iterable[ast.stmt]:
+    """Yield import statements, descending into conditional blocks.
+
+    Two idioms put imports somewhere other than the top level, and both are
+    common enough that skipping them loses real edges:
+
+    - `if TYPE_CHECKING:` — the annotation-only imports, which are exactly the
+      ones naming where a re-exported symbol actually lives. httpx binds its
+      console-script entry point this way, and nothing else in the file says
+      that `main` comes from `._main`.
+    - `try: import fast except ImportError: import slow` — the optional
+      dependency pattern.
+
+    Both branches of either are walked. A name bound in only one of them is
+    still a name this file can call, and recording both is what keeps the
+    resolver from silently classifying it as external.
+    """
+    for node in body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        elif isinstance(node, ast.If):
+            yield from _import_statements(node.body)
+            yield from _import_statements(node.orelse)
+        elif isinstance(node, ast.Try):
+            yield from _import_statements(node.body)
+            yield from _import_statements(node.orelse)
+            yield from _import_statements(node.finalbody)
+            for handler in node.handlers:
+                yield from _import_statements(handler.body)
+
+
 def _imports(tree: ast.Module, module_name: str, is_package: bool) -> Dict[str, str]:
     """Map each name a file binds by import to the dotted module it came from."""
     table: Dict[str, str] = {}
-    for node in tree.body:
+    for node in _import_statements(tree.body):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.asname:
@@ -495,6 +531,8 @@ def _imports(tree: ast.Module, module_name: str, is_package: bool) -> Dict[str, 
                 else (node.module or '')
             )
             for alias in node.names:
+                if alias.name == '*':
+                    continue  # a star import binds nothing we can name
                 bound = alias.asname or alias.name
                 table[bound] = '{}.{}'.format(base, alias.name) if base else alias.name
     return table
@@ -699,6 +737,60 @@ def _find_readme(directory: Path) -> Optional[str]:
     return None
 
 
+def declared_entry_points(root: Path) -> List[str]:
+    """Console scripts a `pyproject.toml` above this tree declares.
+
+    `[project.scripts]` is the only place a package states, rather than
+    implies, where it is meant to be entered. Everything else recce has is
+    inference — a `__main__` guard, a decorator it recognises, a function
+    called `main`, or the shape of the call graph — and inference is what
+    produces a map that opens on a helper because nothing happened to call it.
+
+    Returns dotted `module:function` targets as written. Reading this needed
+    `tomllib`, which is the concrete thing the 3.11 floor bought: a TOML parser
+    that is not a dependency, on a tool whose whole premise is having none.
+
+    A malformed or unreadable file yields nothing. This is a bonus signal, and
+    failing a map over a `pyproject.toml` recce was not asked about would be a
+    poor trade.
+    """
+    for directory in _project_dirs(root):
+        candidate = directory / 'pyproject.toml'
+        if not candidate.is_file():
+            continue
+        try:
+            with candidate.open('rb') as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            return []
+        scripts = data.get('project', {}).get('scripts', {})
+        if isinstance(scripts, dict):
+            return [str(v) for v in scripts.values()]
+    return []
+
+
+def _project_dirs(root: Path) -> Iterable[Path]:
+    """Directories to look in for a `pyproject.toml`, nearest first.
+
+    Walking up is right here where it was wrong for READMEs, and the
+    difference is what the file claims. A README one level up describes the
+    project a file happens to sit in; a `pyproject.toml` above a package
+    describes *that package*, which is what every build tool already assumes.
+    The src layout makes the walk necessary rather than optional — flask's
+    manifest is two levels above `src/flask`.
+
+    The walk stops at the repository root, since a `pyproject.toml` outside it
+    belongs to something else entirely, and gives up after a few levels when
+    there is no `.git` to find.
+    """
+    directory = root if root.is_dir() else root.parent
+    for _ in range(_PYPROJECT_SEARCH_LEVELS):
+        yield directory
+        if (directory / '.git').exists() or directory.parent == directory:
+            return
+        directory = directory.parent
+
+
 def discover(target: Path) -> Project:
     """Parse a file, a package, or a directory of scripts into a `Project`."""
     target = target.resolve()
@@ -708,11 +800,13 @@ def discover(target: Path) -> Project:
         project.root = str(target.parent)
         module = extract_module(target, _module_name_for(target, root))
         project.modules[module.name] = module
+        project.declared_entries = declared_entry_points(target.parent)
         return project
 
     root = _package_root(target)
     project.root = str(target)
     project.readme = _find_readme(target)
+    project.declared_entries = declared_entry_points(target)
     for dirpath, dirnames, filenames in os.walk(target):
         dirnames[:] = sorted(
             d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')

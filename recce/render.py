@@ -54,6 +54,22 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
         lines.append('**Base:** `{}`'.format(_as_dir(base)))
         lines.append('')
 
+    broken = [m for m in project.modules.values() if m.parse_error]
+    if broken:
+        # A map of a package where a third of the files would not parse still
+        # looks like a map. The stderr warning is easy to miss and impossible
+        # to see at all in a saved file, so the document has to say it itself.
+        names = ', '.join(sorted(os.path.basename(m.path) for m in broken)[:4])
+        if len(broken) > 4:
+            names += ', …'
+        lines.append(
+            '> **Incomplete.** {} of {} files did not parse and are missing '
+            'from this map ({}). A newer interpreter may read them.'.format(
+                len(broken), len(project.modules), names
+            )
+        )
+        lines.append('')
+
     if plan.strategy != 'single':
         noun = 'module' if plan.strategy == 'module' else 'entry-point flow'
         note = 'Splitting by {} for fit. {} blocks'.format(noun, len(plan.blocks))

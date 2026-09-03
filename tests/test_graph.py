@@ -83,3 +83,13 @@ def test_logging_is_filtered_out_as_plumbing(build):
         'a.py',
     )
     assert '[logging]' not in text
+
+
+def test_the_stdlib_is_recognised_for_ranking(build):
+    """Used to rank externals, never to hide them; both kinds still bracket."""
+    from recce.graph import is_stdlib
+
+    assert is_stdlib('pathlib')
+    assert is_stdlib('os')
+    assert not is_stdlib('pydub')
+    assert not is_stdlib('boto3')
