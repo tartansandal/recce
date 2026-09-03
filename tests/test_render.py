@@ -95,3 +95,36 @@ def test_return_annotations_ride_on_the_edge(build):
         'a.py',
     )
     assert '─→ int?' in text
+
+
+def test_scalar_constants_do_not_crowd_out_real_shapes(build):
+    """`NOT_APPLICABLE — str` costs a line to say nothing.
+
+    Found on `xray-analysis`, where five of ten data bullets were bare scalars
+    and the record types they displaced were the ones worth naming.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\nimport re\n\nNOT_APPLICABLE = "n/a"\nROUNDS = 3\n'
+            'PATTERN = re.compile("x")\nALIASES = {"a": "b"}\n\n\n'
+            'def go(rows):\n    for r in rows:\n        if r:\n            print(r)\n',
+        },
+        'a.py',
+    )
+    data = [line for line in text.splitlines() if line.startswith('- `')]
+    assert any('PATTERN' in line for line in data)
+    assert any('ALIASES' in line for line in data)
+    assert not any('NOT_APPLICABLE' in line for line in data)
+    assert not any('ROUNDS' in line for line in data)
+
+
+def test_scalars_return_when_there_is_nothing_better(build):
+    """A module whose only names are strings still gets them listed."""
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\nHOST = "example"\n\n\n'
+            'def go(rows):\n    for r in rows:\n        if r:\n            print(r)\n',
+        },
+        'a.py',
+    )
+    assert '- `HOST` — str' in text

@@ -655,14 +655,37 @@ def _ensure_block_spine(funcs: Sequence[Func]) -> None:
     max(candidates, key=lambda f: (f.score, -f.lineno)).role = SPINE
 
 
+def _is_test_module(module) -> bool:
+    """Whether a module is a test suite rather than the thing under test."""
+    name = module.path.rsplit('/', 1)[-1]
+    return (
+        name.startswith('test_')
+        or name.endswith('_test.py')
+        or '/tests/' in module.path
+        or '/test/' in module.path
+    )
+
+
 def _select_modules(project: Project, max_blocks: int) -> List[str]:
-    """Which modules get a block, in the order they should be read."""
+    """Which modules get a block, in the order they should be read.
+
+    Tests are ranked below source when the slots run out. They are kept in the
+    walk on purpose — a test suite is often the clearest statement of what code
+    is for — but a project with three modules and three test modules should not
+    spend half its map on the tests. Pointed at a test directory, where tests
+    are all there is, nothing is deprioritised and they fill the map as they
+    should.
+    """
     order = [n for n in _module_order(project) if project.modules[n].funcs]
     if len(order) <= max_blocks:
         return order
+    has_source = any(not _is_test_module(project.modules[n]) for n in order)
     ranked = sorted(
         order,
-        key=lambda n: -max(f.score for f in project.modules[n].funcs),
+        key=lambda n: (
+            has_source and _is_test_module(project.modules[n]),
+            -max(f.score for f in project.modules[n].funcs),
+        ),
     )
     keep = set(ranked[:max_blocks])
     return [n for n in order if n in keep]

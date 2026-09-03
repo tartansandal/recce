@@ -204,3 +204,47 @@ def test_a_readme_beside_a_package_is_a_valid_purpose(build):
         '.',
     )
     assert 'Tools for chewing through webserver logs' in text.splitlines()[0]
+
+
+def _many_modules(count, prefix):
+    """`count` modules of the same shape, each with something worth showing."""
+    files = {}
+    for index in range(count):
+        files['{}{}.py'.format(prefix, index)] = (
+            '"""Module {}."""\n\n\ndef entry_{}(xs):\n'
+            '    total = 0\n    for x in xs:\n        if x:\n            total += x\n'
+            '    return total\n'.format(index, index)
+        )
+    return files
+
+
+def test_source_modules_outrank_tests_for_block_slots(build):
+    """weep has three scripts and three test files, and spent half its map on tests.
+
+    Sources take the slots first. Tests fill whatever is left over rather than
+    being excluded, since an empty slot helps nobody.
+    """
+    files = {}
+    files.update(_many_modules(10, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(10, 'test_t').items()})
+    _, _, mapping, _ = build(files, '.')
+    titles = [b.title for b in mapping.blocks]
+    assert all(not t.startswith('test_') for t in titles), titles
+
+
+def test_tests_still_fill_slots_the_source_does_not_need(build):
+    files = {}
+    files.update(_many_modules(2, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(10, 'test_t').items()})
+    _, _, mapping, _ = build(files, '.')
+    titles = [b.title for b in mapping.blocks]
+    assert any(t.startswith('src') for t in titles)
+    assert any(t.startswith('test_t') for t in titles)
+
+
+def test_a_test_directory_on_its_own_still_maps(build):
+    """Nothing is deprioritised when tests are all there is."""
+    files = {'tests/' + k: v for k, v in _many_modules(10, 'test_t').items()}
+    _, _, mapping, _ = build(files, '.')
+    assert mapping.blocks
+    assert all(b.title.startswith('test_t') for b in mapping.blocks)

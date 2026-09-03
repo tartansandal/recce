@@ -26,6 +26,21 @@ LEGEND = '★ read first · ~ skim · `[brackets]` = external'
 _BRACKET_COLUMN = 44
 _MAX_WIDTH = 78
 
+# How many data bullets a reader will take in before the section stops being a
+# summary of the shapes and becomes a listing of the names.
+_DATA_BULLETS = 10
+
+# Shapes that name a value's type rather than its structure. `NOT_APPLICABLE —
+# str` costs a line to say the constant is a string, which its use site would
+# have told the reader anyway. Seen on real code: two of `weep`'s ten data
+# bullets and five of `xray-analysis`'s were these, crowding out record types
+# that actually needed describing.
+_SCALAR_SHAPES = frozenset({'str', 'int', 'float', 'bool', 'bytes', 'complex'})
+
+
+def _is_scalar(shape: str) -> bool:
+    return shape in _SCALAR_SHAPES
+
 
 def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
     """Render the whole document."""
@@ -212,8 +227,17 @@ def _data_section(project: Project) -> List[str]:
 
     for module in project.modules.values():
         for constant in module.constants:
-            if constant.shape:
+            if constant.shape and not _is_scalar(constant.shape):
                 bullets.append('- `{}` — {}'.format(constant.name, constant.shape))
+
+    # Scalars come back only if nothing better exists. A module whose only
+    # module-level names are strings still deserves them listed; a module with
+    # eight record types does not need two of its ten slots spent on `str`.
+    if not bullets:
+        for module in project.modules.values():
+            for constant in module.constants:
+                if constant.shape and _is_scalar(constant.shape):
+                    bullets.append('- `{}` — {}'.format(constant.name, constant.shape))
 
     # Deduplicate names that several modules re-export, keeping first mention.
     seen = set()
@@ -223,4 +247,4 @@ def _data_section(project: Project) -> List[str]:
         if key not in seen:
             seen.add(key)
             unique.append(bullet)
-    return unique[:10]
+    return unique[:_DATA_BULLETS]
