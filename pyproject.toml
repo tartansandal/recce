@@ -1,0 +1,59 @@
+# recce is stdlib-only on purpose. The machines it most needs to run on are
+# locked-down build servers where a third-party wheel is a provenance question
+# and `pip install` may not be an option at all. Copy the `recce/` directory
+# across and `python3 -m recce <path>` works; nothing here is required for that.
+#
+# This file exists to pin the dev tools and to make `uv tool install .` a
+# convenience on machines where it is allowed. `uv.lock` is committed so ruff
+# and pytest do not drift between checkouts.
+#
+# `requires-python` is the floor the code supports, and `.python-version` pins
+# the dev venv to that same 3.9 so a 3.10-only construct fails here rather than
+# on the server. Note the floor cuts both ways: `ast.parse` on 3.9 cannot read
+# 3.10+ syntax, so mapping a codebase that uses `match` needs a newer
+# interpreter to run recce, even though recce itself stays 3.9-compatible.
+
+[project]
+name = 'recce'
+version = '0.1.0'
+description = 'A reconnaissance pass over unfamiliar code: the spine, who calls whom, and what is external.'
+requires-python = '>=3.9'
+dependencies = []
+
+[project.scripts]
+recce = 'recce.cli:main'
+
+[dependency-groups]
+dev = ['pytest', 'ruff']
+
+[build-system]
+requires = ['uv_build>=0.9,<0.10']
+build-backend = 'uv_build'
+
+[tool.uv.build-backend]
+module-name = 'recce'
+module-root = ''
+
+[tool.ruff]
+line-length = 88
+
+# The rule set is pinned rather than inherited, because ruff's default select
+# has changed between releases and a lint contract that moves on upgrade is
+# not a contract. E/F/B/I is the core: real errors, likely bugs, import order.
+#
+# `UP` (pyupgrade) is deliberately absent. It wants `list[str]` and `str | None`
+# in place of the `typing` spellings, which are safe here only because every
+# module opens with `from __future__ import annotations` — delete that one line
+# and the code stops importing on the 3.9 interpreters this tool exists to run
+# on, with no warning from the linter that just asked for it. The `typing`
+# forms have no such dependency, and a tool whose selling point is running on
+# old locked-down boxes should not carry a tripwire in its annotations.
+[tool.ruff.lint]
+select = ['E4', 'E7', 'E9', 'F', 'B', 'I']
+
+[tool.ruff.format]
+quote-style = 'single'
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+pythonpath = ['.']

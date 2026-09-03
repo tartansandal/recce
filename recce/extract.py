@@ -1,0 +1,653 @@
+"""Parse Python sources into the records in `model.py`, using `ast` only.
+
+Everything here is textual and static. Nothing is imported, nothing is
+executed, and no type inference is attempted beyond reading annotations that
+are already written down. That is the deal recce makes: it will miss the edges
+that only exist at runtime, and in exchange it can be pointed at code nobody is
+allowed to run.
+
+Two extraction choices are worth knowing before you change anything:
+
+- **Nested functions are folded into their parent.** A closure defined and used
+  inside one function is part of that function's shape, not a place a reader
+  navigates to, so its calls and its branches count toward the enclosing
+  function and it gets no row of its own. The visitor therefore never descends
+  into a function body looking for more definitions.
+- **A call is recorded by the root of its dotted chain**, not by its final
+  attribute. `pydub.AudioSegment.export()` is recorded with root `pydub`,
+  because the import table is keyed on that root and it is the only thing that
+  can tell us whether the call leaves the project. Chains that do not bottom
+  out in a plain name — `results[0].save()`, `factory().run()` — get a null
+  root and will be dropped by the resolver rather than guessed at.
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import re
+import tokenize
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from .model import Call, Class, Constant, Func, Module, Project
+
+# Directories that are never someone's source tree, skipped on the walk. Test
+# directories are deliberately absent: a test suite is often the best available
+# description of what the code is for, and the caller can exclude it if not.
+SKIP_DIRS = frozenset(
+    {
+        '.git',
+        '.hg',
+        '.svn',
+        '.venv',
+        'venv',
+        'env',
+        '__pycache__',
+        '.mypy_cache',
+        '.pytest_cache',
+        '.ruff_cache',
+        '.tox',
+        'node_modules',
+        'build',
+        'dist',
+        'site-packages',
+    }
+)
+
+# Nodes that mean the reader has to hold a second possibility in their head.
+# The count is a complexity proxy, and it is the strongest single signal we
+# have for which function holds the interesting logic.
+_BRANCH_NODES = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+    ast.ExceptHandler,
+    ast.IfExp,
+    ast.comprehension,
+)
+
+_FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+# Typing containers whose bracket form says the same thing in fewer characters.
+_CONTAINER_SHORTHAND = {
+    'List': '[{}]',
+    'list': '[{}]',
+    'Set': '{{{}}}',
+    'set': '{{{}}}',
+}
+
+
+def first_sentence(text: Optional[str]) -> Optional[str]:
+    """Return the first sentence of a docstring, collapsed onto one line.
+
+    Docstring summaries are usually already one sentence, but a one-paragraph
+    summary is common enough that taking the whole first paragraph would blow
+    the purpose line's budget.
+    """
+    if not text:
+        return None
+    para = text.strip().split('\n\n')[0]
+    para = ' '.join(para.split())
+    if not para:
+        return None
+    match = re.search(r'(?<![A-Z])[.!?](?:\s|$)', para)
+    if match:
+        para = para[: match.start() + 1]
+    return para.rstrip('.') or None
+
+
+def compress_type(node: Optional[ast.AST]) -> Optional[str]:
+    """Render an annotation in the shortest form that keeps its meaning.
+
+    The map's job is to show what flows along an edge, and the written-out
+    generic forms defeat that — `Optional[List[Tuple[str, float]]]` is nine
+    tokens of type-system grammar wrapped around the two that matter. The
+    rewrites are purely notational:
+
+    - `Optional[X]` becomes `X?`
+    - `List[X]` becomes `[X]`, `Dict[K, V]` becomes `{K: V}`
+    - `Tuple[A, B]` becomes `(A, B)`
+    - `Union[A, B]` and `A | B` both become `A|B`
+    - a `typing.` or other module prefix is dropped
+
+    Anything not recognised is unparsed as written, so an unusual annotation
+    degrades to being verbose rather than to being wrong.
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return 'None'
+        # A string annotation is a forward reference; the text is the type.
+        return str(node.value) if isinstance(node.value, str) else _unparse(node)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        # `typing.Optional` and `t.Optional` both mean Optional to a reader.
+        return node.attr
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return '{}|{}'.format(compress_type(node.left), compress_type(node.right))
+    if isinstance(node, ast.Subscript):
+        return _compress_subscript(node)
+    if isinstance(node, ast.Tuple):
+        return ', '.join(compress_type(e) or '?' for e in node.elts)
+    if isinstance(node, ast.Ellipsis) or (
+        isinstance(node, ast.Constant) and node.value is Ellipsis
+    ):
+        return '...'
+    return _unparse(node)
+
+
+def _compress_subscript(node: ast.Subscript) -> str:
+    base = compress_type(node.value) or '?'
+    inner_node = node.slice
+    if inner_node.__class__.__name__ == 'Index':  # 3.8 shape, harmless on 3.9+
+        inner_node = inner_node.value  # type: ignore[attr-defined]
+    parts = (
+        [compress_type(e) or '?' for e in inner_node.elts]
+        if isinstance(inner_node, ast.Tuple)
+        else [compress_type(inner_node) or '?']
+    )
+    inner = ', '.join(parts)
+    if base == 'Optional':
+        return '{}?'.format(inner)
+    if base == 'Union':
+        return '|'.join(parts)
+    if base in _CONTAINER_SHORTHAND:
+        return _CONTAINER_SHORTHAND[base].format(inner)
+    if base in ('Dict', 'dict') and len(parts) == 2:
+        return '{{{}: {}}}'.format(parts[0], parts[1])
+    if base in ('Tuple', 'tuple'):
+        return '({})'.format(inner)
+    return '{}[{}]'.format(base, inner)
+
+
+def _unparse(node: ast.AST) -> str:
+    """Best-effort source text for a node, collapsed onto one line."""
+    try:
+        text = ast.unparse(node)  # 3.9+
+    except Exception:
+        return '?'
+    return ' '.join(text.split())
+
+
+def _dotted_of(node: ast.AST) -> Tuple[Optional[str], str, str]:
+    """Split a callee expression into (root, final attribute, dotted text).
+
+    Returns a null root when the chain does not bottom out in a plain name,
+    which is the signal the resolver uses to drop a call rather than guess.
+    """
+    parts: List[str] = []
+    cur: ast.AST = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        parts.reverse()
+        return parts[0], parts[-1], '.'.join(parts)
+    parts.reverse()
+    dotted = '.'.join(parts) if parts else _unparse(node)
+    return None, (parts[-1] if parts else dotted), dotted
+
+
+def _body_metrics(
+    body: Iterable[ast.stmt],
+) -> Tuple[int, int, List[Call], List[str], int]:
+    """Measure a function body in one walk.
+
+    Returns the statement count, the branch count, the call sites, the keys of
+    any dict literal the body returns, and a count of string literals.
+
+    The last of those is the least obvious and the most useful. A function
+    thick with string literals is almost always building output, and output
+    builders branch as much as real logic does — a report writer looping over
+    its sections looks exactly like an aggregator looping over records if all
+    you count is `For` nodes. The count is what lets the scorer tell them
+    apart.
+
+    The walk deliberately covers nested definitions too, so a function that
+    hides its work in a closure is not scored as though it were empty.
+    """
+    n_stmts = 0
+    n_branches = 0
+    n_strings = 0
+    returns_keys: List[str] = []
+    calls: List[Call] = []
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.stmt):
+                n_stmts += 1
+            if isinstance(node, _BRANCH_NODES):
+                n_branches += 1
+            if _is_prose_string(node):
+                n_strings += 1
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                for key in node.value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        if key.value not in returns_keys:
+                            returns_keys.append(key.value)
+            if isinstance(node, ast.Call):
+                root, attr, dotted = _dotted_of(node.func)
+                calls.append(
+                    Call(
+                        dotted=dotted,
+                        root=root,
+                        attr=attr,
+                        lineno=getattr(node, 'lineno', 0),
+                    )
+                )
+    # `ast.walk` is breadth-first, so the calls come out in tree order rather
+    # than source order. The map reads top to bottom the way the function does,
+    # which means the line number is what orders the children.
+    calls.sort(key=lambda c: c.lineno)
+    return n_stmts, n_branches, calls, returns_keys, n_strings
+
+
+def _is_prose_string(node: ast.AST) -> bool:
+    """Whether a string literal is text for a human rather than a key.
+
+    This distinction is what makes the string count usable as a signal. A
+    function full of dict keys and regex group names — `'status'`, `'method'` —
+    is not building output, but counting every `str` constant made it look
+    identical to one that is, and the two ended up scoring the same.
+
+    An f-string is always prose: nothing interpolates into a key. Otherwise the
+    tell is a space, because identifiers do not have them and sentences do.
+    """
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return ' ' in node.value.strip()
+    return False
+
+
+def _decorator_names(node: ast.AST) -> List[str]:
+    names = []
+    for dec in getattr(node, 'decorator_list', []):
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        _, attr, dotted = _dotted_of(target)
+        names.append(dotted or attr)
+    return names
+
+
+def _arg_names(node: ast.AST) -> List[str]:
+    """Positional and keyword-only parameter names, minus `self` and `cls`."""
+    spec = node.args  # type: ignore[attr-defined]
+    names = [a.arg for a in list(getattr(spec, 'posonlyargs', [])) + list(spec.args)]
+    names += [a.arg for a in spec.kwonlyargs]
+    return [n for n in names if n not in ('self', 'cls')]
+
+
+def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Func:
+    n_stmts, n_branches, calls, returns_keys, n_strings = _body_metrics(
+        node.body  # type: ignore[attr-defined]
+    )
+    doc = ast.get_docstring(node)  # type: ignore[arg-type]
+    if doc:
+        n_stmts -= 1  # the docstring is an Expr statement, not work
+        n_strings -= 1
+    name = node.name  # type: ignore[attr-defined]
+    end = getattr(node, 'end_lineno', node.lineno) or node.lineno  # type: ignore[attr-defined]
+    return Func(
+        name=name,
+        qualname='{}.{}'.format(cls, name) if cls else name,
+        module=module,
+        path=path,
+        lineno=node.lineno,  # type: ignore[attr-defined]
+        end_lineno=end,
+        args=_arg_names(node),
+        returns=compress_type(node.returns),  # type: ignore[attr-defined]
+        doc=first_sentence(doc),
+        decorators=_decorator_names(node),
+        calls=calls,
+        n_stmts=max(n_stmts, 0),
+        n_branches=n_branches,
+        n_strings=max(n_strings, 0),
+        returns_keys=returns_keys,
+        loc=max(end - node.lineno + 1, 1),  # type: ignore[attr-defined]
+        cls=cls,
+        is_async=isinstance(node, ast.AsyncFunctionDef),
+    )
+
+
+def _literal_shape(node: Optional[ast.AST]) -> Optional[str]:
+    """Name the shape of a module-level value, for the data-shapes section.
+
+    Only the outline is wanted. A list of tuples is worth saying; which tuples
+    is not, and the reader can open the file for that.
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Call):
+        _, attr, dotted = _dotted_of(node.func)
+        if dotted.startswith('re.compile') or attr == 'compile':
+            return 'regex'
+        return '{}(...)'.format(attr)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        elts = node.elts
+        opener, closer = ('[', ']') if isinstance(node, ast.List) else ('(', ')')
+        if isinstance(node, ast.Set):
+            opener, closer = '{', '}'
+        if not elts:
+            return '{}{}'.format(opener, closer)
+        inner = _literal_shape(elts[0]) or '?'
+        return '{}{}{}'.format(opener, inner, closer)
+    if isinstance(node, ast.Dict):
+        if not node.keys:
+            return '{}'
+        key = _literal_shape(node.keys[0]) or '?'
+        val = _literal_shape(node.values[0]) or '?'
+        return '{{{}: {}}}'.format(key, val)
+    if isinstance(node, ast.Constant):
+        return type(node.value).__name__
+    if isinstance(node, ast.JoinedStr):
+        return 'str'
+    return None
+
+
+def _header_comment(source: str) -> Optional[str]:
+    """The top-of-file comment block, if the file leads with one.
+
+    This is the third of the three purpose sources the map is allowed to use,
+    and it only counts when it is genuinely a header: a shebang, a coding
+    line, or a PEP 723 metadata block is machinery rather than description, so
+    all three are skipped and the block after them is what gets read.
+    """
+    lines: List[str] = []
+    in_pep723 = False
+    for raw in source.splitlines():
+        line = raw.strip()
+        if not line:
+            if lines:
+                break
+            continue
+        if not line.startswith('#'):
+            break
+        body = line.lstrip('#').strip()
+        if line.startswith('#!') or body.startswith('-*-') or 'coding:' in body:
+            continue
+        if body.startswith('///'):
+            in_pep723 = not in_pep723
+            continue
+        if in_pep723:
+            continue
+        lines.append(body)
+    text = ' '.join(line for line in lines if line)
+    return first_sentence(text) if text else None
+
+
+def _resolve_relative(
+    module_name: str, level: int, target: Optional[str], is_package: bool
+) -> str:
+    """Turn a `from . import x` target into an absolute dotted module name.
+
+    One dot means "the package this module lives in", and which name that is
+    depends on what the importing module is. For `pkg.cli` the package is
+    everything but the last component. For `pkg/__init__.py`, which we address
+    as plain `pkg`, the package is the whole name — there is no component to
+    strip, because stripping already happened when the file was named.
+
+    Getting this backwards is quiet rather than loud: `from .parser import
+    parse_line` inside `pkg.cli` resolves to `pkg.cli.parser`, which matches no
+    module, so the call is classified external and the cross-file edge simply
+    never appears in the map.
+    """
+    parts = module_name.split('.')
+    keep = len(parts) - level + (1 if is_package else 0)
+    base = parts[: max(keep, 0)]
+    if target:
+        base = base + target.split('.')
+    return '.'.join(p for p in base if p)
+
+
+def _imports(tree: ast.Module, module_name: str, is_package: bool) -> Dict[str, str]:
+    """Map each name a file binds by import to the dotted module it came from."""
+    table: Dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    table[alias.asname] = alias.name
+                else:
+                    # `import a.b.c` binds only `a`.
+                    table[alias.name.split('.')[0]] = alias.name.split('.')[0]
+        elif isinstance(node, ast.ImportFrom):
+            base = (
+                _resolve_relative(module_name, node.level, node.module, is_package)
+                if node.level
+                else (node.module or '')
+            )
+            for alias in node.names:
+                bound = alias.asname or alias.name
+                table[bound] = '{}.{}'.format(base, alias.name) if base else alias.name
+    return table
+
+
+def _class_fields(node: ast.ClassDef) -> List[Tuple[str, Optional[str]]]:
+    """Annotated class attributes, plus whatever `__init__` assigns to self."""
+    fields: List[Tuple[str, Optional[str]]] = []
+    seen = set()
+    for stmt in node.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            fields.append((stmt.target.id, compress_type(stmt.annotation)))
+            seen.add(stmt.target.id)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id not in seen:
+                    fields.append((target.id, _literal_shape(stmt.value)))
+                    seen.add(target.id)
+    for stmt in node.body:
+        if isinstance(stmt, _FUNC_NODES) and stmt.name == '__init__':
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign):
+                    for target in sub.targets:
+                        is_self_attr = (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == 'self'
+                        )
+                        if is_self_attr and target.attr not in seen:
+                            fields.append((target.attr, _literal_shape(sub.value)))
+                            seen.add(target.attr)
+    return fields
+
+
+def _class_kind(node: ast.ClassDef, bases: List[str], decorators: List[str]) -> str:
+    """Classify a class by whether its fields or its methods are the story."""
+    if any(d.endswith('dataclass') for d in decorators):
+        return 'dataclass'
+    for base in bases:
+        tail = base.split('.')[-1]
+        if tail == 'NamedTuple':
+            return 'namedtuple'
+        if tail == 'TypedDict':
+            return 'typeddict'
+        if tail in ('Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag'):
+            return 'enum'
+        if tail in ('Protocol', 'ABC'):
+            return 'protocol'
+    return 'class'
+
+
+def extract_module(
+    path: Path, module_name: str, source: Optional[str] = None
+) -> Module:
+    """Parse one file into a `Module`.
+
+    A file that will not parse comes back as a `Module` carrying `parse_error`
+    rather than raising. One unreadable file in a package should cost you that
+    file's rows, not the whole map.
+    """
+    if source is None:
+        source = _read_source(path)
+    module = Module(
+        name=module_name,
+        path=str(path),
+        doc=None,
+        header_comment=None,
+        is_package=path.name == '__init__.py',
+    )
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        module.parse_error = '{}: line {}'.format(exc.msg, exc.lineno)
+        return module
+
+    module.doc = first_sentence(ast.get_docstring(tree))
+    module.header_comment = None if module.doc else _header_comment(source)
+    module.imports = _imports(tree, module_name, module.is_package)
+
+    for node in tree.body:
+        if isinstance(node, _FUNC_NODES):
+            module.funcs.append(_make_func(node, module_name, str(path), None))
+        elif isinstance(node, ast.ClassDef):
+            bases = [_dotted_of(b)[2] for b in node.bases]
+            decorators = _decorator_names(node)
+            methods = []
+            for stmt in node.body:
+                if isinstance(stmt, _FUNC_NODES):
+                    func = _make_func(stmt, module_name, str(path), node.name)
+                    module.funcs.append(func)
+                    methods.append(func.qualname)
+            module.classes.append(
+                Class(
+                    name=node.name,
+                    module=module_name,
+                    path=str(path),
+                    lineno=node.lineno,
+                    bases=bases,
+                    doc=first_sentence(ast.get_docstring(node)),
+                    fields=_class_fields(node),
+                    methods=methods,
+                    kind=_class_kind(node, bases, decorators),
+                )
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module.constants.append(
+                Constant(
+                    name=node.target.id,
+                    module=module_name,
+                    lineno=node.lineno,
+                    shape=compress_type(node.annotation),
+                )
+            )
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                # Only shouted names. A lowercase module-level assignment is
+                # usually a singleton or a bit of setup, not a data shape the
+                # reader needs named up front.
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    module.constants.append(
+                        Constant(
+                            name=target.id,
+                            module=module_name,
+                            lineno=node.lineno,
+                            shape=_literal_shape(node.value),
+                        )
+                    )
+        elif isinstance(node, ast.If) and _is_main_guard(node):
+            calls = _body_metrics(node.body)[2]
+            module.main_calls = calls
+
+    return module
+
+
+def _is_main_guard(node: ast.If) -> bool:
+    test = node.test
+    if not isinstance(test, ast.Compare) or not isinstance(test.left, ast.Name):
+        return False
+    if test.left.id != '__name__':
+        return False
+    return any(
+        isinstance(c, ast.Constant) and c.value == '__main__' for c in test.comparators
+    )
+
+
+def _read_source(path: Path) -> str:
+    """Read a source file, honouring any PEP 263 coding declaration."""
+    try:
+        with tokenize.open(str(path)) as handle:
+            return handle.read()
+    except (SyntaxError, UnicodeDecodeError, LookupError):
+        return path.read_text(encoding='utf-8', errors='replace')
+
+
+def _module_name_for(path: Path, root: Path) -> str:
+    """Dotted name for a file, relative to the tree root recce was given."""
+    rel = path.relative_to(root)
+    parts = list(rel.parts)
+    parts[-1] = parts[-1][: -len('.py')]
+    if parts[-1] == '__init__':
+        parts.pop()
+    return '.'.join(parts) if parts else root.name
+
+
+def _package_root(directory: Path) -> Path:
+    """Walk up out of a package so module names keep their package prefix.
+
+    Pointed at `pkg/`, we want `pkg.cli` rather than `cli`, because the prefix
+    is what makes a cross-module reference in the map unambiguous. Pointed at a
+    plain directory of scripts there is no prefix to keep, so the directory
+    itself is the root.
+    """
+    root = directory
+    while (root / '__init__.py').exists() and root.parent != root:
+        root = root.parent
+    return root
+
+
+def _find_readme(directory: Path) -> Optional[str]:
+    """First prose paragraph of a README sitting in this exact directory.
+
+    The search deliberately does not walk up, and a single-file target does not
+    get one at all. A README one level up describes the project a file happens
+    to sit in, which is not the same claim as describing that file — pointed at
+    a fixture inside a test suite, walking up produced a purpose line about the
+    test harness and attached it to the code under test.
+
+    A wrong purpose line is worse than no purpose line. It is the first thing
+    read and the reader has no way to tell it was guessed, so when the three
+    permitted sources are silent the right output is silence.
+    """
+    for name in ('README.md', 'README.rst', 'README.txt', 'README'):
+        candidate = directory / name
+        if not candidate.exists():
+            continue
+        text = candidate.read_text(encoding='utf-8', errors='replace')
+        for para in text.split('\n\n'):
+            stripped = para.strip()
+            # Skip the title line and any badge soup above the prose.
+            if stripped and not stripped.startswith(('#', '=', '[!', '<')):
+                return first_sentence(stripped)
+    return None
+
+
+def discover(target: Path) -> Project:
+    """Parse a file, a package, or a directory of scripts into a `Project`."""
+    target = target.resolve()
+    project = Project()
+    if target.is_file():
+        root = _package_root(target.parent)
+        project.root = str(target.parent)
+        module = extract_module(target, _module_name_for(target, root))
+        project.modules[module.name] = module
+        return project
+
+    root = _package_root(target)
+    project.root = str(target)
+    project.readme = _find_readme(target)
+    for dirpath, dirnames, filenames in os.walk(target):
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')
+        )
+        for filename in sorted(filenames):
+            if not filename.endswith('.py'):
+                continue
+            path = Path(dirpath) / filename
+            module = extract_module(path, _module_name_for(path, root))
+            project.modules[module.name] = module
+    return project
