@@ -231,6 +231,40 @@ def test_preference_order_beats_size(monkeypatch):
     assert notes.resolve_model() == 'qwen2.5-coder:14b'
 
 
+def test_a_coding_build_beats_the_size_fallback(monkeypatch):
+    """The dev104 shape: one big coding build, one tiny general model.
+
+    Without `qwen3.6` in the list nothing matched, the size fallback took the
+    smallest installed, and a 1B general model wrote the notes on a box with
+    96GB of VRAM sitting behind it.
+    """
+    _tags(
+        monkeypatch,
+        [
+            ('llama3.2:1b', 1_300_000_000),
+            ('qwen3.6:35b-a3b-coding-mtp-q4_K_M', 22_600_000_000),
+        ],
+    )
+    assert notes.resolve_model() == 'qwen3.6:35b-a3b-coding-mtp-q4_K_M'
+
+
+def test_a_small_code_family_still_beats_qwen3_6(monkeypatch):
+    """Why `qwen3.6` is last: a note is one line and the 7B answers in one second.
+
+    Both are code-capable, so this is not about quality. It is about not
+    silently moving a machine that has `qwen2.5-coder` pulled from a one-second
+    note to a twenty-second one.
+    """
+    _tags(
+        monkeypatch,
+        [
+            ('qwen2.5-coder:7b', 4_700_000_000),
+            ('qwen3.6:35b-a3b-coding-mtp-q4_K_M', 22_600_000_000),
+        ],
+    )
+    assert notes.resolve_model() == 'qwen2.5-coder:7b'
+
+
 def test_an_embedding_model_is_never_picked(monkeypatch):
     """It does not answer /api/generate, so picking it fails every note."""
     _tags(monkeypatch, [('nomic-embed-text:latest', 274_000_000)])
@@ -466,6 +500,48 @@ class TestATimeoutIsNotADeadServer:
     def test_timeouts_do_not_make_the_model_look_worse_than_it_is(self):
         report = notes.Report(filled=3, rejected=1, timed_out=6)
         assert report.kept_rate == 0.75
+
+
+class TestTheSummaryNamesTheModel:
+    """Which model wrote the notes is the fact that makes a map reproducible.
+
+    The note cache keys on the model name, so two maps of the same tree can
+    differ for no visible reason. recce announced its choice only on the
+    `auto` path, which left a model pinned by `--model` or `RECCE_MODEL`
+    nowhere in the output, and made a name that is simply not pulled report as
+    a bare 'unavailable' with nothing saying which name had failed.
+    """
+
+    def test_the_summary_names_the_model_that_wrote_the_notes(self):
+        report = notes.Report(model='qwen3.6:35b', asked=2, filled=2)
+        assert 'qwen3.6:35b' in report.summary()
+        assert '2 filled' in report.summary()
+
+    def test_an_unavailable_model_is_named_too(self):
+        """A pulled name and a typo fail identically without it."""
+        report = notes.Report(model='qwen3.6:typo', error='connection refused')
+        assert 'qwen3.6:typo' in report.summary()
+        assert 'unavailable' in report.summary()
+
+    def test_a_report_with_no_model_reads_as_it_always_did(self):
+        report = notes.Report(asked=1, filled=1)
+        assert report.summary().startswith('notes: 1 filled')
+
+    def test_fill_stamps_the_model_it_was_given(self, monkeypatch):
+        """The wiring: `summary()` can only name it if `fill` records it."""
+        monkeypatch.setattr(
+            notes, '_ask', lambda *a, **k: 'loops over rows, totals bytes by status'
+        )
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(
+            [make(name='f', loops=2, loc=10)], model='qwen3.6:35b', use_cache=False
+        )
+        assert report.model == 'qwen3.6:35b'
+        assert 'qwen3.6:35b' in report.summary()
+
+    def test_a_run_with_nothing_to_ask_about_is_stamped_too(self):
+        """The early return is a separate path out of `fill`."""
+        assert notes.fill([], model='qwen3.6:35b').model == 'qwen3.6:35b'
 
 
 class TestFailuresThatAreAboutOneFunction:
