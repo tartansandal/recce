@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
         '-o', '--out', type=Path, default=None, help='write to a file instead of stdout'
     )
     parser.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help='overwrite the --out file if it already exists',
+    )
+    parser.add_argument(
         '--max-lines',
         type=int,
         default=None,
@@ -161,6 +167,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.target.exists():
         print(
             'recce: no such file or directory: {}'.format(args.target), file=sys.stderr
+        )
+        return 2
+
+    # Checked here rather than at the write, and the distance is the point: a
+    # `--draft` run against a 27B spends a quarter of an hour in the model
+    # before there is anything to write, and refusing after that wait is a
+    # worse answer than refusing before it.
+    #
+    # What `--out` names stopped being disposable when `--draft` arrived. The
+    # map used to be a cheap artifact where an overwrite cost a rerun; a draft
+    # is annotated by hand for days, the notes cache means recce's own
+    # sentences come back, and the reader's marginal ones do not. The refresh
+    # command and the destroy command were the same keystrokes.
+    if args.out and args.out.exists() and not args.force:
+        print(
+            'recce: {} exists; --force to overwrite'.format(args.out), file=sys.stderr
         )
         return 2
 
