@@ -33,12 +33,18 @@ DEFAULT_MAX_LINES = 40
 # lasting hours or days, saved, and then edited by hand as the reader learns
 # the code; it is a starting document, not a screenful.
 #
-# 120 is measured, not chosen. `notes` is the first entry in `_CONCESSION_ORDER`,
-# so a tight budget starves it: on requests, 40 asked notes rendered 5 at the
-# default, 21 at 80, and all 40 at 120. Past 120 nothing changes — 200 gives
-# the identical map — because the budget has stopped binding and no concession
-# fires at all. The concession order is not wrong here; the pressure is.
-DRAFT_MAX_LINES = 120
+# 200 is measured, not chosen, and it took two codebases to find. `notes` is
+# the first entry in `_CONCESSION_ORDER`, so a tight budget starves it: on
+# requests, 40 asked notes rendered 5 at the default, 21 at 80, and all 40 at
+# 120, with 200 giving a byte-identical map.
+#
+# 120 would be the answer if requests were the whole world. It is not: rich is
+# 100 modules to requests' 19, and at 120 it still renders only 23 of 40 while
+# 200 renders all 40. Where the budget stops binding is a property of the tree,
+# so the number has to clear the larger case, and clearing it costs the smaller
+# case nothing at all — requests is the same map either way. The concession
+# order is not wrong here; the pressure is.
+DRAFT_MAX_LINES = 200
 DRAFT_NOTES_LIMIT = 40
 
 
@@ -119,6 +125,16 @@ def build_parser() -> argparse.ArgumentParser:
             'default was tuned for; it is part of the cache key, so a change '
             're-asks rather than serving answers written to another limit'
         ).format(notes.MAX_NOTE_CHARS),
+    )
+    parser.add_argument(
+        '--max-source-chars',
+        type=int,
+        default=notes.MAX_SOURCE_CHARS,
+        metavar='N',
+        help=(
+            'longest function body to ask about at all (default: {}). Raise it '
+            'when the machine serving the model can take it'
+        ).format(notes.MAX_SOURCE_CHARS),
     )
     parser.add_argument(
         '--notes-timeout',
@@ -240,6 +256,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_chars=args.note_chars,
             timeout=args.notes_timeout,
             rendered=rendered,
+            max_source_chars=args.max_source_chars,
         )
         # `--stats` prints this same line further down, and printing it twice
         # made a failed run look like two failed runs.

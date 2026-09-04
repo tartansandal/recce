@@ -48,6 +48,7 @@ recce pkg/ -o /tmp/map.md --force         # overwrite one that is already there
 recce pkg/ --stats                        # what it parsed, to stderr
 recce pkg/ --json                         # the intermediate state, not the map
 recce pkg/ --draft                        # a map to save and annotate, not read once
+recce pkg/ --max-source-chars 20000       # ask about long functions too, given the memory
 ```
 
 `--out` will not write over a file that already exists. That is a small
@@ -67,17 +68,19 @@ hand as you learn the code — it is a document, and a document is not a
 screenful. `--draft` is the second case:
 
 ```sh
-recce pkg/ --draft -o code-map.md         # --max-lines 120, --notes-limit 40
+recce pkg/ --draft -o code-map.md         # --max-lines 200, --notes-limit 40
 ```
 
 Both are still ordinary flags and either one given explicitly still wins, so
 `--draft --max-lines 60` means 60.
 
-The number is measured rather than chosen. Notes are the first thing the budget
-gives up, so a tight one starves them: on `requests`, 40 requested notes
-rendered 5 at the default, 21 at 80, and all 40 at 120. Past that nothing
-changes — 200 produces a byte-identical map — because the budget has stopped
-binding and no concession fires at all.
+The number is measured rather than chosen, and it took two codebases to settle.
+Notes are the first thing the budget gives up, so a tight one starves them: on
+`requests`, 40 requested notes rendered 5 at the default, 21 at 80, and all 40
+at 120, with 200 giving a byte-identical map. On `rich` — 100 modules to
+`requests`' 19 — 120 renders 23 of 40 and 200 renders all 40. Where the budget
+stops binding is a property of the tree being mapped, so the default has to
+clear the larger case, and clearing it costs the smaller one nothing.
 
 Since that file is one you will be writing in, `--out` refuses to overwrite an
 existing one without `--force`. The command that refreshes a draft and the
@@ -224,6 +227,13 @@ Two things to know before reaching for one:
   rejected for being blank. It reads exactly like a model that cannot write a
   sentence. Qwen 3.6 also dropped the `/no_think` switch its predecessors took
   in the prompt, so the API field is the only way left to say it.
+- **A very long function is skipped rather than asked about**, because a model
+  small enough to run locally can die on the prompt: an 18GB model on a 24GB
+  machine returned `[METAL] Insufficient Memory` on a 296-line function, and
+  since that function scored highest and was asked first, the whole run
+  produced nothing. `--max-source-chars` raises the limit, which is worth doing
+  when the model is served by something larger — the same function answers in
+  under a second on a 96GB card.
 - **The length cap is tuned for a terse model.** A denser one writes past it and
   gets trimmed at the last clause that fits: `qwen3.8:27b` answered one function
   in 114 characters, of which 90 survived and *"returns early or builds blocks

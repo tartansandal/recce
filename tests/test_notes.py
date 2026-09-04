@@ -589,3 +589,28 @@ class TestOnlyAskAboutFunctionsThatRender:
         body = make(name='__init__')
         body.lineno = 42
         assert notes.key_of(stub) != notes.key_of(body)
+
+
+def test_the_source_cap_is_an_argument_not_a_constant(monkeypatch):
+    """It encodes the machine serving the model, not anything about recce.
+
+    A 24GB laptop dies on a 6000-character prompt; a box with 96GB of VRAM
+    answers the same one in six tenths of a second.
+    """
+    asked = []
+
+    def spy(host, model, source, timeout, shape='', max_chars=90):
+        asked.append(len(source))
+        return 'loops over rows, buckets by status, totals the bytes'
+
+    monkeypatch.setattr(notes, '_ask', spy)
+    monkeypatch.setattr(notes, '_source_of', lambda f: 'x' * 9000)
+
+    tight = notes.fill([make(loops=2)], model='m', use_cache=False)
+    assert (asked, tight.oversized, tight.asked) == ([], 1, 0)
+
+    roomy = notes.fill(
+        [make(loops=2)], model='m', use_cache=False, max_source_chars=20000
+    )
+    assert asked == [9000]
+    assert (roomy.oversized, roomy.filled) == (0, 1)

@@ -127,19 +127,25 @@ DEFAULT_LIMIT = 12
 # limit by two tenths of a second and over it under any load at all.
 DEFAULT_TIMEOUT = 300.0
 
-# Past this a function is not asked about at all, and there are two unrelated
-# reasons that is right.
+# Past this a function is not asked about at all. This is a default rather than
+# a rule, and `--max-source-chars` moves it, because what it really encodes is
+# the machine serving the model rather than anything about recce.
 #
-# The honest one: nothing 6000 characters long compresses into ninety. `rich`
-# has a 296-line `traverse`, and no single sentence about it is worth a line.
+# It was found the hard way: an 18GB model on a 24GB machine dies on a prompt
+# that size. `qwen3.8:27b-mlx` returned HTTP 500 with `mlx runner failed:
+# panic: [METAL] Insufficient Memory` on rich's 296-line `traverse`, and
+# because that function scores highest it was asked first, so a whole 40-note
+# draft produced nothing. On that hardware the wall is between 5449 characters
+# (fine) and 6084 (dead). Bound it in characters, not `loc`: a 135-line
+# function reached 6084 while a 137-line one stopped at 5376.
 #
-# The one that was found the hard way: an 18GB model on a 24GB machine dies on
-# a prompt that size. `qwen3.8:27b-mlx` returned HTTP 500 with `mlx runner
-# failed: panic: [METAL] Insufficient Memory` on exactly that function, and
-# because it scored highest it was asked first, so a whole 40-note draft of
-# `rich` produced nothing. Measured on this hardware the wall is between 5449
-# characters (fine) and 6084 (dead); `loc` is the wrong unit to bound it with,
-# since a 135-line function reached 6084 while a 137-line one stopped at 5376.
+# It was also justified here on the grounds that nothing 6000 characters long
+# compresses into ninety, and that turned out to be too strong. Asked about
+# that same `traverse` on a box with 96GB of VRAM, qwen3.6 answered "recurses
+# on objects, stops at max depth or cycles" in six tenths of a second -- thin
+# for 296 lines, but true, and better than the silence the cap imposes. So the
+# cap costs something real on hardware that does not need it, which is the
+# argument for the flag rather than for a larger constant.
 MAX_SOURCE_CHARS = 6000
 
 # `candidates` is asked for more than the limit so that skipping an oversized
@@ -573,6 +579,7 @@ def fill(
     use_cache: bool = True,
     max_chars: int = MAX_NOTE_CHARS,
     rendered: Optional[Set[tuple]] = None,
+    max_source_chars: int = MAX_SOURCE_CHARS,
 ) -> Report:
     """Write a note onto the functions worth one. Never raises."""
     report = Report()
@@ -600,7 +607,7 @@ def fill(
         source = _source_of(func)
         if source is None:
             continue
-        if len(source) > MAX_SOURCE_CHARS:
+        if len(source) > max_source_chars:
             report.oversized += 1
             continue
         report.asked += 1
