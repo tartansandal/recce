@@ -61,6 +61,21 @@ DEFAULT_MODEL = os.environ.get('RECCE_MODEL')
 # Preferred first. These are the families trained on code, which is what a
 # note about loops and branches asks for; anything else is a fallback that
 # still has to survive the same checks against the syntax tree.
+#
+# `qwen3.6` is last on purpose, and it is the one entry that is not a
+# code-trained family. It is a general family with coding builds — the
+# coding-ness is in the tag (`qwen3.6:35b-a3b-coding-mtp-q4_K_M`), not the
+# name — and it is here because a box that has one pulled and nothing else
+# code-trained was picking a 1B general model off the size fallback. Ordering
+# it after the real code families is what keeps that fix from costing anything
+# elsewhere: a machine holding both still gets `qwen2.5-coder:7b`, which
+# answers a one-line note in about a second where a 35B takes twenty.
+#
+# The consequence of naming a family rather than a build: the smallest build
+# still wins within it, so pulling a general `qwen3.6:8b` alongside a coding
+# build would take precedence over the coding one. Sorting a `coding` tag
+# first inside a matched family would fix that, at the cost of a second
+# ranking axis; it has not been needed yet.
 _PREFERRED_MODELS = (
     'qwen2.5-coder',
     'qwen3-coder',
@@ -69,6 +84,7 @@ _PREFERRED_MODELS = (
     'codellama',
     'starcoder2',
     'granite-code',
+    'qwen3.6',
 )
 
 # Past this the note stops being an annotation and becomes a paragraph
@@ -204,6 +220,14 @@ _PREAMBLE = re.compile(
 class Report:
     """What happened, so the caller can say so rather than guess."""
 
+    # Which model wrote the notes. It leads `summary()` because it is the one
+    # fact that makes a map reproducible -- the note cache keys on it, so two
+    # maps of the same tree differ for no visible reason when they were
+    # annotated by different models. recce announces its choice only when it
+    # resolved `auto`, so a model pinned by `--model` or `RECCE_MODEL` was
+    # otherwise nowhere in the output, and a name that is simply not pulled
+    # reported as a bare 'unavailable' with nothing saying which name failed.
+    model: Optional[str] = None
     asked: int = 0
     filled: int = 0
     cached: int = 0
@@ -227,9 +251,10 @@ class Report:
         # Only a run that produced nothing is 'unavailable'. Once a timeout is
         # survivable a run can end early having already written half its notes,
         # and reporting that as unavailable would throw away the true count.
+        lead = 'notes: {} - '.format(self.model) if self.model else 'notes: '
         if self.error and not (self.filled or self.cached):
-            return 'notes: unavailable ({})'.format(self.error)
-        line = 'notes: {} filled, {} cached, {} rejected of {} asked'.format(
+            return lead + 'unavailable ({})'.format(self.error)
+        line = lead + '{} filled, {} cached, {} rejected of {} asked'.format(
             self.filled, self.cached, self.rejected, self.asked
         )
         if self.timed_out:
@@ -582,7 +607,7 @@ def fill(
     max_source_chars: int = MAX_SOURCE_CHARS,
 ) -> Report:
     """Write a note onto the functions worth one. Never raises."""
-    report = Report()
+    report = Report(model=model)
     chosen = candidates(funcs, limit * _OVERSAMPLE, rendered)
     if not chosen:
         return report

@@ -164,10 +164,18 @@ recce pkg/ --model                    # whichever installed one it finds
 Given no value, `--model` picks from what Ollama has pulled: a code-trained
 family first — `qwen2.5-coder`, `deepseek-coder`, `codellama` and the like, in
 that order — and the smallest build of it, because a note is one line and the
-7B answers as well as the 32B and answers sooner. Failing those, the smallest
-model installed that is not an embedding model. It prints which one it chose,
-since the note cache is keyed on the model name and a map is only reproducible
-if you know what wrote it.
+7B answers as well as the 32B and answers sooner. Then `qwen3.6`, which is a
+general family with coding builds rather than a code-trained one, so it ranks
+below all of them and wins only where nothing better is pulled — on a server
+holding one 35B coding build and a 1B general model, the alternative was the
+1B. Failing every one of those, the smallest model installed that is not an
+embedding model.
+
+recce prints which one it chose, since the note cache is keyed on the model
+name and a map is only reproducible if you know what wrote it. A model you
+pinned yourself is not announced that way — you named it — but `--stats` and
+any failure line carry it either way, so a name that is not pulled reports as
+`notes: qwen3.6:typo - unavailable (...)` rather than a bare `unavailable`.
 
 Set `RECCE_MODEL=auto` to get that without the flag, or `RECCE_MODEL=<name>` to
 pin one:
