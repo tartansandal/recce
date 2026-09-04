@@ -59,12 +59,20 @@ because breaking it makes the map actively misleading rather than merely worse.
 
   `--draft` does not break this rule, it steps outside the case the rule is
   about: a map read once on screen and a map saved and annotated for days are
-  not the same artifact. Worth knowing before you touch `_CONCESSION_ORDER`,
-  though — under a loose budget it never fires at all. On `requests` the map at
-  `--max-lines 200` is byte-identical to the one at 120, because by 120 there
-  is nothing left to concede. Any change to the order is therefore invisible in
-  draft mode and only observable at the default, which is the opposite of where
-  you would think to look for it.
+  not the same artifact.
+
+  Where the budget stops binding is a property of the codebase, not a number
+  you can learn once. On `requests` it is 120 — the map at 200 is byte
+  identical. On `rich` it is 200, and at `--draft`'s 120 the concessions are
+  still firing, rendering 14 notes where 200 renders 21. So `--draft` is tuned
+  to requests-scale and under-serves a 100-module tree, and a change to
+  `_CONCESSION_ORDER` is invisible above the knee for whatever tree you happen
+  to test on. Check it at the default, and on something big.
+
+  Above that knee a second ceiling takes over that no budget can lift: `rich`
+  renders 8 of 100 modules, so at most 21 of 40 candidates were ever on the
+  page. That is what `rendered_funcs` and the `rendered` argument to
+  `notes.candidates` are for.
 - **Model output is checked against the syntax tree.** `notes.py` knows from
   `n_loops` whether a function actually loops, so a note claiming one where
   none exists is not a judgement call but a falsified statement, and it is
@@ -158,14 +166,24 @@ copies fit the budget. Ninety-nine passing tests never saw it.
   `qwen2.5-coder:7b`. Do not gate it on a list of which models reason, and note
   that 3.6 dropped the `/no_think` prompt switch, so the field is the only way
   left to say it.
-- **Timeouts are per note, connection errors are per run.** `fill` used to
-  treat them alike and stop on the first failure, which was right when a note
-  cost a second. It is not: `qwen3.8:27b` answers a 93-line function in 59.8
-  seconds, so under the old 60-second default one slow function abandoned every
-  note after it, and `--draft` produced nothing at all against the model it
-  exists for. A timeout now costs its own note; `_MAX_CONSECUTIVE_TIMEOUTS` in
-  a row is read as a wedged server. Count consecutively, never cumulatively —
-  two slow functions in a forty-function run are not a dead Ollama.
+- **Timeouts and 5xx are per note; connection errors are per run.** `fill`
+  used to treat every failure alike and stop on the first, which was right when
+  a note cost a second. It made `--draft` return nothing at all against a 27B
+  twice, for two different reasons. First a timeout: `qwen3.8:27b` answers a
+  93-line function in 59.8 seconds, so the old 60-second default meant one slow
+  function abandoned every note after it. Then, once that was fixed, an HTTP
+  500 — `mlx runner failed: panic: [METAL] Insufficient Memory` on `rich`'s
+  296-line `traverse`, which scores highest and so is asked first, losing all
+  40. Both now cost one note; `_MAX_CONSECUTIVE_FAILURES` in a row is read as a
+  wedged server. Count consecutively, never cumulatively — two awkward
+  functions in a run of forty are not a dead Ollama.
+- **A function too long to describe is not asked about.** `MAX_SOURCE_CHARS`
+  is the OOM guard above, but it would earn its place without that: nothing
+  6000 characters long compresses into ninety. Bound it in characters, not
+  `loc` — a 135-line function measured 6084 characters while a 137-line one
+  measured 5376, so lines do not predict the wall. `candidates` is oversampled
+  by `_OVERSAMPLE` so a skipped function costs its own slot rather than costing
+  the run a note.
 - **`--out` refuses to overwrite.** The check sits beside the target check
   rather than at the write, and it must stay there: a `--draft` run against a
   27B spends a quarter of an hour in the model before there is a byte to write,

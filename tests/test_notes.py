@@ -433,7 +433,7 @@ class TestATimeoutIsNotADeadServer:
         monkeypatch.setattr(notes, '_ask', always_slow)
         monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
         report = notes.fill(self._funcs(40), model='m', use_cache=False)
-        assert len(calls) == notes._MAX_CONSECUTIVE_TIMEOUTS
+        assert len(calls) == notes._MAX_CONSECUTIVE_FAILURES
         assert report.error and 'in a row' in report.error
 
     def test_the_streak_is_consecutive_not_cumulative(self, monkeypatch):
@@ -466,3 +466,126 @@ class TestATimeoutIsNotADeadServer:
     def test_timeouts_do_not_make_the_model_look_worse_than_it_is(self):
         report = notes.Report(filled=3, rejected=1, timed_out=6)
         assert report.kept_rate == 0.75
+
+
+class TestFailuresThatAreAboutOneFunction:
+    """A 5xx joins the timeout, for the same reason and by the same route.
+
+    The claim that a non-timeout failure means the server is gone was written
+    with a refused socket in mind, where it holds. It does not hold for the
+    500 that actually turned up: an out-of-memory panic in the model runner on
+    one very long function, with the next function a tenth the size and fine.
+    """
+
+    def _funcs(self, n):
+        return [make(name='f{}'.format(i), loops=2, loc=10 + i) for i in range(n)]
+
+    def _http(self, code):
+        import urllib.error
+
+        return urllib.error.HTTPError('u', code, 'boom', {}, None)
+
+    def test_one_server_error_costs_one_note(self, monkeypatch):
+        calls = []
+
+        def flaky(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            if len(calls) == 2:
+                raise self._http(500)
+            return 'loops over rows, buckets by status, totals the bytes'
+
+        monkeypatch.setattr(notes, '_ask', flaky)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(4), model='m', limit=4, use_cache=False)
+        assert len(calls) == 4, 'the run stopped instead of skipping the bad one'
+        assert (report.filled, report.server_errors, report.error) == (3, 1, None)
+
+    def test_a_4xx_is_not_survivable(self, monkeypatch):
+        """A 404 is a model that is not pulled: every later call is identical."""
+        calls = []
+
+        def missing(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            raise self._http(404)
+
+        monkeypatch.setattr(notes, '_ask', missing)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(5), model='m', limit=5, use_cache=False)
+        assert len(calls) == 1
+        assert report.server_errors == 0
+
+    def test_mixed_failures_share_one_streak(self, monkeypatch):
+        """Alternating kinds still mean the server has stopped answering."""
+        calls = []
+
+        def alternating(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            raise TimeoutError('slow') if len(calls) % 2 else self._http(503)
+
+        monkeypatch.setattr(notes, '_ask', alternating)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(40), model='m', limit=40, use_cache=False)
+        assert len(calls) == notes._MAX_CONSECUTIVE_FAILURES
+        assert report.timed_out + report.server_errors == 3
+        assert 'in a row' in (report.error or '')
+
+
+class TestAFunctionTooLongToDescribe:
+    def test_it_is_never_asked_about(self, monkeypatch):
+        asked = []
+
+        def spy(host, model, source, timeout, shape='', max_chars=90):
+            asked.append(len(source))
+            return 'loops over rows, buckets by status, totals the bytes'
+
+        monkeypatch.setattr(notes, '_ask', spy)
+        monkeypatch.setattr(
+            notes, '_source_of', lambda f: 'x' * (notes.MAX_SOURCE_CHARS + 1)
+        )
+        report = notes.fill([make(loops=2)], model='m', use_cache=False)
+        assert asked == []
+        assert (report.asked, report.oversized) == (0, 1)
+
+    def test_skipping_one_costs_its_slot_not_a_note(self, monkeypatch):
+        """Oversampling is the point: the next best candidate moves up."""
+        funcs = [make(name='f{}'.format(i), loops=2, loc=10 + i) for i in range(9)]
+        huge = {'f8', 'f7', 'f6'}
+
+        monkeypatch.setattr(
+            notes,
+            '_source_of',
+            lambda f: (
+                'x' * (notes.MAX_SOURCE_CHARS + 1)
+                if f.name in huge
+                else 'def go(): pass'
+            ),
+        )
+        monkeypatch.setattr(
+            notes,
+            '_ask',
+            lambda *a, **k: 'loops over rows, buckets by status, totals bytes',
+        )
+        report = notes.fill(funcs, model='m', limit=5, use_cache=False)
+        assert report.asked == 5, 'a skipped function shortened the run'
+        assert report.filled == 5
+
+
+class TestOnlyAskAboutFunctionsThatRender:
+    def test_a_function_off_the_page_is_not_asked_about(self):
+        on = make(name='shown', loops=2)
+        off = make(name='hidden', loops=2)
+        off.qualname = 'hidden'
+        picked = notes.candidates([on, off], 10, rendered={notes.key_of(on)})
+        assert [f.name for f in picked] == ['shown']
+
+    def test_no_set_means_no_filter(self):
+        funcs = [make(name='a', loops=2), make(name='b', loops=2)]
+        funcs[1].qualname = 'b'
+        assert len(notes.candidates(funcs, 10)) == 2
+
+    def test_the_key_separates_overloads_sharing_a_name(self):
+        """requests declares HTTPBasicAuth.__init__ three times."""
+        stub = make(name='__init__')
+        body = make(name='__init__')
+        body.lineno = 42
+        assert notes.key_of(stub) != notes.key_of(body)

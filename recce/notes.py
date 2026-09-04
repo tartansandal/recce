@@ -21,11 +21,11 @@ Three guardrails matter more than the prompt:
   code gives the same map. That matters if maps get committed or diffed.
 - **Failure is silent, and costs only what it has to.** No Ollama, a refused
   connection, a model that is not pulled — all of them leave every `Func.note`
-  empty and the map renders exactly as it does without a model. A timeout is
-  narrower: it means one function was long, not that the server is gone, so it
-  costs that note alone and the run carries on. Only a run of them in
-  succession is read as the server having stopped answering. The notes are an
-  enhancement to something that already stands up.
+  empty and the map renders exactly as it does without a model. A timeout or a
+  5xx is narrower: it means one function was awkward, not that the server is
+  gone, so it costs that note alone and the run carries on. Only a run of them
+  in succession is read as the server having stopped answering. The notes are
+  an enhancement to something that already stands up.
 
 Nothing here is imported unless notes are asked for, so recce stays stdlib-only
 in the sense that matters: the default path opens no sockets and reads no cache.
@@ -42,7 +42,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Set
 
 from .model import SPINE, TRIVIAL, Func
 
@@ -127,12 +127,34 @@ DEFAULT_LIMIT = 12
 # limit by two tenths of a second and over it under any load at all.
 DEFAULT_TIMEOUT = 300.0
 
-# How many timeouts in a row before the server is presumed wedged rather than
-# merely slow. One timeout is now survivable — see `fill` — but survivable
-# cannot mean unbounded, or a hung Ollama turns a 40-function draft run into
-# forty consecutive full-length waits. Three is enough to distinguish a couple
-# of long functions from a server that has stopped answering.
-_MAX_CONSECUTIVE_TIMEOUTS = 3
+# Past this a function is not asked about at all, and there are two unrelated
+# reasons that is right.
+#
+# The honest one: nothing 6000 characters long compresses into ninety. `rich`
+# has a 296-line `traverse`, and no single sentence about it is worth a line.
+#
+# The one that was found the hard way: an 18GB model on a 24GB machine dies on
+# a prompt that size. `qwen3.8:27b-mlx` returned HTTP 500 with `mlx runner
+# failed: panic: [METAL] Insufficient Memory` on exactly that function, and
+# because it scored highest it was asked first, so a whole 40-note draft of
+# `rich` produced nothing. Measured on this hardware the wall is between 5449
+# characters (fine) and 6084 (dead); `loc` is the wrong unit to bound it with,
+# since a 135-line function reached 6084 while a 137-line one stopped at 5376.
+MAX_SOURCE_CHARS = 6000
+
+# `candidates` is asked for more than the limit so that skipping an oversized
+# function costs it its slot rather than the run a note: the next best
+# candidate moves up. Two is ample -- the worst case seen is `rich`, where 5
+# of 40 are over the cap.
+_OVERSAMPLE = 2
+
+# How many per-note failures in a row before the server is presumed wedged
+# rather than merely struggling. A timeout or a 5xx is survivable on its own —
+# see `fill` — but survivable cannot mean unbounded, or a hung Ollama turns a
+# 40-function draft into forty consecutive full-length waits. Three is enough
+# to tell a couple of awkward functions from a server that has stopped
+# answering.
+_MAX_CONSECUTIVE_FAILURES = 3
 
 PROMPT = """\
 Describe the control flow of this Python function in ONE short line.
@@ -181,6 +203,8 @@ class Report:
     cached: int = 0
     rejected: int = 0
     timed_out: int = 0
+    server_errors: int = 0
+    oversized: int = 0
     reasons: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -204,6 +228,10 @@ class Report:
         )
         if self.timed_out:
             line += ', {} timed out'.format(self.timed_out)
+        if self.server_errors:
+            line += ', {} server errors'.format(self.server_errors)
+        if self.oversized:
+            line += ', {} too long to ask about'.format(self.oversized)
         if self.error:
             line += '; stopped early: {}'.format(self.error)
         if self.reasons:
@@ -226,13 +254,35 @@ def cache_path() -> Path:
     return Path(base) / 'recce' / 'notes.json'
 
 
-def candidates(funcs: Sequence[Func], limit: int = DEFAULT_LIMIT) -> List[Func]:
+def key_of(func: Func) -> tuple:
+    """Identity for a function across two runs of `plan`.
+
+    Not `id()` and not `qualname` alone. requests declares `HTTPBasicAuth.
+    __init__` three times — two `@overload` stubs and the body — so a name is
+    not unique within a module, and the line number is what separates them.
+    """
+    return (func.module, func.qualname, func.lineno)
+
+
+def candidates(
+    funcs: Sequence[Func],
+    limit: int = DEFAULT_LIMIT,
+    rendered: Optional[Set[tuple]] = None,
+) -> List[Func]:
     """The functions whose shape is worth a sentence, best first.
 
     Branching is the filter. A function with no conditionals has nothing for
     the note to say that the row above it has not already said, and spending a
     line on `returns the joined lines` is how a map fills up with words that
     are individually true and collectively useless.
+
+    `rendered` is the second filter and it only starts mattering at scale.
+    Scoring is global while the map is not: `rich` is 100 modules and shows 8,
+    so ranking the whole project and taking the top 40 asked about 19 functions
+    in modules the reader never sees — half the model time spent on rows that
+    do not exist. Given the set of functions a plan actually put on the page,
+    those are skipped and the slots go to functions that are there. On a
+    codebase small enough to render whole, this changes nothing.
     """
     worth = [
         f
@@ -240,6 +290,7 @@ def candidates(funcs: Sequence[Func], limit: int = DEFAULT_LIMIT) -> List[Func]:
         if f.role != TRIVIAL
         and f.loc >= MIN_LOC
         and (f.n_loops >= MIN_LOOPS or f.n_branches >= MIN_BRANCHES)
+        and (rendered is None or key_of(f) in rendered)
     ]
     worth.sort(key=lambda f: (f.role != SPINE, -f.score, f.module, f.lineno))
     return worth[:limit]
@@ -500,6 +551,19 @@ def _is_timeout(exc: BaseException) -> bool:
     return isinstance(getattr(exc, 'reason', None), TimeoutError)
 
 
+def _is_server_error(exc: BaseException) -> bool:
+    """A 5xx: this request failed, not every request from now on.
+
+    Written after claiming the opposite. A refused connection genuinely does
+    mean the next call fails identically, and `fill` stops on one; a 500 was
+    filed under the same heading and got the same treatment. But the 500 seen
+    in practice was an out-of-memory panic in the model runner on one very
+    long function, and the next function was a tenth the size and answered
+    fine. Stopping the run threw away thirty-nine notes to avoid one.
+    """
+    return isinstance(exc, urllib.error.HTTPError) and 500 <= exc.code < 600
+
+
 def fill(
     funcs: Sequence[Func],
     model: str,
@@ -508,10 +572,11 @@ def fill(
     timeout: float = DEFAULT_TIMEOUT,
     use_cache: bool = True,
     max_chars: int = MAX_NOTE_CHARS,
+    rendered: Optional[Set[tuple]] = None,
 ) -> Report:
     """Write a note onto the functions worth one. Never raises."""
     report = Report()
-    chosen = candidates(funcs, limit)
+    chosen = candidates(funcs, limit * _OVERSAMPLE, rendered)
     if not chosen:
         return report
 
@@ -524,13 +589,19 @@ def fill(
             cache = {}
 
     dirty = False
-    # Counted in a row, not in total: two slow functions in a forty-function
-    # run are the model being slow, while three in succession are the server
-    # being gone. A cache hit leaves the count alone, having asked nothing.
-    consecutive_timeouts = 0
+    # A cache hit leaves this alone, having asked nothing.
+    consecutive_failures = 0
     for func in chosen:
+        # `chosen` is oversampled, so this is where the limit is really
+        # applied: a function skipped for being unaskable hands its slot to
+        # the next best rather than shortening the run.
+        if report.asked >= limit:
+            break
         source = _source_of(func)
         if source is None:
+            continue
+        if len(source) > MAX_SOURCE_CHARS:
+            report.oversized += 1
             continue
         report.asked += 1
         shape = shape_of(func)
@@ -542,27 +613,30 @@ def fill(
         try:
             raw = _ask(host, model, source, timeout, shape, max_chars)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
-            # A refused socket and a slow generation are not the same failure,
-            # and treating them alike is what made `--draft` produce nothing at
-            # all against a 27B. A connection error really does mean every
-            # remaining call fails the same way, so stopping is right. A
-            # timeout only means this function was long — the next one may be
-            # short — so it costs one note, not the other thirty-nine.
+            # Two questions, in order: is this failure about this function, or
+            # about the server? A refused socket is about the server and every
+            # remaining call fails identically, so stopping is right. A timeout
+            # and a 5xx are about this function — it was long — and the next
+            # one may be short. Treating those as fatal is what made `--draft`
+            # return nothing at all against a 27B, twice, for two different
+            # reasons.
             if _is_timeout(exc):
                 report.timed_out += 1
-                consecutive_timeouts += 1
-                if consecutive_timeouts < _MAX_CONSECUTIVE_TIMEOUTS:
-                    continue
-                # Slow is survivable; wedged is not. Past this the wait stops
-                # being evidence about one function and starts being evidence
-                # about the server.
-                report.error = 'timed out {} times in a row'.format(
-                    consecutive_timeouts
-                )
+            elif _is_server_error(exc):
+                report.server_errors += 1
+            else:
+                report.error = str(getattr(exc, 'reason', None) or exc)
                 break
-            report.error = str(getattr(exc, 'reason', None) or exc)
-            break
-        consecutive_timeouts = 0
+            # Survivable is not the same as unbounded. Counted in a row rather
+            # than in total, because two bad functions in a run of forty are
+            # two bad functions, while three together are a server that has
+            # stopped answering and will not start again this run.
+            consecutive_failures += 1
+            if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                report.error = 'failed {} times in a row'.format(consecutive_failures)
+                break
+            continue
+        consecutive_failures = 0
         reason = why_rejected(
             raw or '',
             n_loops=func.n_loops,

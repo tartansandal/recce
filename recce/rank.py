@@ -899,3 +899,29 @@ def _entry_blocks(
             )
         )
     return blocks
+
+
+def rendered_funcs(mapping: Plan) -> List[Func]:
+    """Every project function the plan actually put on the page.
+
+    The map is not the project. `rich` is 100 modules and renders 8, so
+    ranking the whole project to decide what is worth a note spends half the
+    asks on rows that were never going to exist. Planning once to find out
+    which functions survive, and only then asking about them, is what this is
+    for -- see the call in `cli`.
+
+    External calls have no `func` and contribute nothing, which is right: a
+    bracket at the right margin is not somewhere a note could hang.
+    """
+    found: List[Func] = []
+
+    def walk(node: Node) -> None:
+        if node.func is not None:
+            found.append(node.func)
+        for child in node.children:
+            walk(child)
+
+    for block in mapping.blocks:
+        for root in block.roots:
+            walk(root)
+    return found

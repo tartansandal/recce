@@ -21,7 +21,7 @@ from typing import Optional, Sequence
 from . import __version__, notes
 from .extract import discover
 from .graph import resolve
-from .rank import annotate, plan
+from .rank import annotate, plan, rendered_funcs
 from .render import render
 
 # The budget a map is read on screen with, and the one it is written to a file
@@ -217,6 +217,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print('recce: notes from {}'.format(model), file=sys.stderr)
     if model and not args.no_llm:
         annotate(project, graph)
+        # Plan once before asking anything, purely to find out which functions
+        # reach the page, then ask only about those. Scoring is global and the
+        # map is not: on `rich`, 100 modules ranked and 8 rendered, 19 of 40
+        # asks went to modules the reader never sees.
+        #
+        # The preview is deliberately optimistic. Without notes the blocks fit
+        # more rows, so this set is a superset of what survives once the notes
+        # are added and start costing lines -- which is the concession
+        # mechanism doing its job, not an error. A superset is the right side
+        # to err on: asking about a row that later drops costs one note, while
+        # excluding one that would have stayed loses it for good.
+        rendered = {
+            notes.key_of(f) for f in rendered_funcs(plan(project, graph, max_lines))
+        }
         report = notes.fill(
             project.funcs(),
             model=model,
@@ -225,8 +239,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             use_cache=not args.no_cache,
             max_chars=args.note_chars,
             timeout=args.notes_timeout,
+            rendered=rendered,
         )
-        if report.error:
+        # `--stats` prints this same line further down, and printing it twice
+        # made a failed run look like two failed runs.
+        if report.error and not args.stats:
             print('recce: {}'.format(report.summary()), file=sys.stderr)
 
     mapping = plan(project, graph, max_lines=max_lines)
