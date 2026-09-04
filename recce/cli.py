@@ -115,6 +115,17 @@ def build_parser() -> argparse.ArgumentParser:
         ).format(notes.MAX_NOTE_CHARS),
     )
     parser.add_argument(
+        '--notes-timeout',
+        type=float,
+        default=notes.DEFAULT_TIMEOUT,
+        metavar='SECONDS',
+        help=(
+            'how long one note may take before it is given up on '
+            '(default: {:g}). A timeout costs that note, not the rest of the '
+            'run'
+        ).format(notes.DEFAULT_TIMEOUT),
+    )
+    parser.add_argument(
         '--ollama-host',
         default=notes.DEFAULT_HOST,
         help='where Ollama is listening, else $OLLAMA_HOST (default: {})'.format(
@@ -191,6 +202,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             limit=notes_limit,
             use_cache=not args.no_cache,
             max_chars=args.note_chars,
+            timeout=args.notes_timeout,
         )
         if report.error:
             print('recce: {}'.format(report.summary()), file=sys.stderr)

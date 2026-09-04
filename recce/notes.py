@@ -19,10 +19,13 @@ Three guardrails matter more than the prompt:
   mid-clause reads as a bug.
 - **Notes are cached by content hash**, so a rerun costs nothing and the same
   code gives the same map. That matters if maps get committed or diffed.
-- **Failure is silent and total.** No Ollama, a timeout, a refused connection,
-  a model that is not pulled — all of them leave `Func.note` empty and the map
-  renders exactly as it does without a model. The notes are an enhancement to
-  something that already stands up.
+- **Failure is silent, and costs only what it has to.** No Ollama, a refused
+  connection, a model that is not pulled — all of them leave every `Func.note`
+  empty and the map renders exactly as it does without a model. A timeout is
+  narrower: it means one function was long, not that the server is gone, so it
+  costs that note alone and the run carries on. Only a run of them in
+  succession is read as the server having stopped answering. The notes are an
+  enhancement to something that already stands up.
 
 Nothing here is imported unless notes are asked for, so recce stays stdlib-only
 in the sense that matters: the default path opens no sockets and reads no cache.
@@ -117,6 +120,20 @@ _BRANCH_CLAIM = re.compile(
 # Asking about every function is slow and pointless — most rows are plumbing.
 DEFAULT_LIMIT = 12
 
+# Long enough that a slow model on a long function is not mistaken for a dead
+# server. Sixty seconds was written when a note cost a second or two and any
+# wait that long really did mean something was wrong. It does not survive a
+# 27B: qwen3.8 answered `main` (93 lines) in 59.8 seconds, inside the old
+# limit by two tenths of a second and over it under any load at all.
+DEFAULT_TIMEOUT = 300.0
+
+# How many timeouts in a row before the server is presumed wedged rather than
+# merely slow. One timeout is now survivable — see `fill` — but survivable
+# cannot mean unbounded, or a hung Ollama turns a 40-function draft run into
+# forty consecutive full-length waits. Three is enough to distinguish a couple
+# of long functions from a server that has stopped answering.
+_MAX_CONSECUTIVE_TIMEOUTS = 3
+
 PROMPT = """\
 Describe the control flow of this Python function in ONE short line.
 
@@ -163,20 +180,32 @@ class Report:
     filled: int = 0
     cached: int = 0
     rejected: int = 0
+    timed_out: int = 0
     reasons: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
     @property
     def kept_rate(self) -> float:
+        # Timeouts are deliberately absent. A rejection is an answer that was
+        # read and refused, which says something about the model; a timeout is
+        # no answer at all, and folding it in here would report a model as
+        # worse for running on a busy machine.
         answered = self.filled + self.rejected
         return self.filled / float(answered) if answered else 0.0
 
     def summary(self) -> str:
-        if self.error:
+        # Only a run that produced nothing is 'unavailable'. Once a timeout is
+        # survivable a run can end early having already written half its notes,
+        # and reporting that as unavailable would throw away the true count.
+        if self.error and not (self.filled or self.cached):
             return 'notes: unavailable ({})'.format(self.error)
         line = 'notes: {} filled, {} cached, {} rejected of {} asked'.format(
             self.filled, self.cached, self.rejected, self.asked
         )
+        if self.timed_out:
+            line += ', {} timed out'.format(self.timed_out)
+        if self.error:
+            line += '; stopped early: {}'.format(self.error)
         if self.reasons:
             detail = ', '.join(
                 '{} {}'.format(count, reason)
@@ -456,12 +485,27 @@ def _ask(
     return body.get('response')
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    """Whether this failure was the clock, rather than the server.
+
+    urllib reports the two shapes of timeout differently: a read that runs out
+    of time raises `TimeoutError` directly, while one that times out
+    connecting arrives as a `URLError` carrying it in `reason`. Both mean the
+    same thing here and only the second is wrapped, so the wrapper is unpacked
+    rather than matched on type alone. `socket.timeout` needs no separate case;
+    it has been an alias of `TimeoutError` since 3.10, below the floor.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(getattr(exc, 'reason', None), TimeoutError)
+
+
 def fill(
     funcs: Sequence[Func],
     model: str,
     host: str = DEFAULT_HOST,
     limit: int = DEFAULT_LIMIT,
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_TIMEOUT,
     use_cache: bool = True,
     max_chars: int = MAX_NOTE_CHARS,
 ) -> Report:
@@ -480,6 +524,10 @@ def fill(
             cache = {}
 
     dirty = False
+    # Counted in a row, not in total: two slow functions in a forty-function
+    # run are the model being slow, while three in succession are the server
+    # being gone. A cache hit leaves the count alone, having asked nothing.
+    consecutive_timeouts = 0
     for func in chosen:
         source = _source_of(func)
         if source is None:
@@ -494,11 +542,27 @@ def fill(
         try:
             raw = _ask(host, model, source, timeout, shape, max_chars)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
-            # One failure means the server is gone or the model is not pulled.
-            # Both make every remaining call fail the same way, so stop rather
-            # than wait out the timeout once per function.
+            # A refused socket and a slow generation are not the same failure,
+            # and treating them alike is what made `--draft` produce nothing at
+            # all against a 27B. A connection error really does mean every
+            # remaining call fails the same way, so stopping is right. A
+            # timeout only means this function was long — the next one may be
+            # short — so it costs one note, not the other thirty-nine.
+            if _is_timeout(exc):
+                report.timed_out += 1
+                consecutive_timeouts += 1
+                if consecutive_timeouts < _MAX_CONSECUTIVE_TIMEOUTS:
+                    continue
+                # Slow is survivable; wedged is not. Past this the wait stops
+                # being evidence about one function and starts being evidence
+                # about the server.
+                report.error = 'timed out {} times in a row'.format(
+                    consecutive_timeouts
+                )
+                break
             report.error = str(getattr(exc, 'reason', None) or exc)
             break
+        consecutive_timeouts = 0
         reason = why_rejected(
             raw or '',
             n_loops=func.n_loops,

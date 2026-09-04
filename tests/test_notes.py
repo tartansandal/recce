@@ -362,3 +362,107 @@ class TestNoteCharsIsAnArgumentNotAConstant:
         # The reason the whole comparison was runnable at all: a thinking
         # model spends num_predict on reasoning and returns an empty response.
         assert sent['body']['think'] is False
+
+
+class TestATimeoutIsNotADeadServer:
+    """The distinction `--draft` forced.
+
+    A note used to cost a second or two, so waiting a full minute for one
+    really did mean the server had gone and abandoning the rest was right.
+    Against a 27B a timeout means the opposite — this function was long — and
+    the old behaviour threw away thirty-nine good notes to save one wait.
+    """
+
+    def _funcs(self, n):
+        return [make(name='f{}'.format(i), loops=2, loc=10 + i) for i in range(n)]
+
+    def test_one_slow_function_costs_one_note(self, monkeypatch):
+        calls = []
+
+        def flaky(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            if len(calls) == 2:
+                raise TimeoutError('read timed out')
+            return 'loops over rows, buckets by status, totals the bytes'
+
+        monkeypatch.setattr(notes, '_ask', flaky)
+        monkeypatch.setattr(
+            notes, '_source_of', lambda f: 'def {}(): pass'.format(f.name)
+        )
+        report = notes.fill(self._funcs(4), model='m', use_cache=False)
+        assert len(calls) == 4, 'the run stopped instead of skipping the slow one'
+        assert (report.filled, report.timed_out, report.error) == (3, 1, None)
+
+    def test_a_timeout_wrapped_in_a_urlerror_counts_the_same(self, monkeypatch):
+        """urllib wraps a connect timeout but raises a read timeout bare."""
+        import urllib.error
+
+        def wrapped(host, model, source, timeout, shape='', max_chars=90):
+            raise urllib.error.URLError(TimeoutError('timed out'))
+
+        monkeypatch.setattr(notes, '_ask', wrapped)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(3), model='m', use_cache=False)
+        assert report.timed_out == 3
+        assert 'in a row' in (report.error or '')
+
+    def test_a_refused_connection_still_stops_the_whole_run(self, monkeypatch):
+        """The original reasoning, which is still right for this case."""
+        import urllib.error
+
+        calls = []
+
+        def refused(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            raise urllib.error.URLError(ConnectionRefusedError('refused'))
+
+        monkeypatch.setattr(notes, '_ask', refused)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(5), model='m', use_cache=False)
+        assert len(calls) == 1, 'kept asking a server that is not there'
+        assert report.timed_out == 0
+        assert 'unavailable' in report.summary()
+
+    def test_timeouts_in_a_row_are_read_as_a_wedged_server(self, monkeypatch):
+        calls = []
+
+        def always_slow(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            raise TimeoutError('read timed out')
+
+        monkeypatch.setattr(notes, '_ask', always_slow)
+        monkeypatch.setattr(notes, '_source_of', lambda f: 'def go(): pass')
+        report = notes.fill(self._funcs(40), model='m', use_cache=False)
+        assert len(calls) == notes._MAX_CONSECUTIVE_TIMEOUTS
+        assert report.error and 'in a row' in report.error
+
+    def test_the_streak_is_consecutive_not_cumulative(self, monkeypatch):
+        """Two slow functions in a long run are slowness, not a dead server."""
+        calls = []
+
+        def every_other(host, model, source, timeout, shape='', max_chars=90):
+            calls.append(source)
+            if len(calls) % 2 == 0:
+                raise TimeoutError('read timed out')
+            return 'loops over rows, buckets by status, totals the bytes'
+
+        monkeypatch.setattr(notes, '_ask', every_other)
+        monkeypatch.setattr(
+            notes, '_source_of', lambda f: 'def {}(): pass'.format(f.name)
+        )
+        report = notes.fill(self._funcs(8), model='m', use_cache=False)
+        assert len(calls) == 8
+        assert (report.filled, report.timed_out, report.error) == (4, 4, None)
+
+    def test_a_part_finished_run_reports_its_notes_not_just_its_error(self):
+        """'unavailable' would discard a true count of what was written."""
+        partial = notes.Report(asked=9, filled=6, timed_out=3, error='timed out')
+        assert 'unavailable' not in partial.summary()
+        assert '6 filled' in partial.summary()
+        assert '3 timed out' in partial.summary()
+        nothing = notes.Report(asked=1, filled=0, error='connection refused')
+        assert 'unavailable' in nothing.summary()
+
+    def test_timeouts_do_not_make_the_model_look_worse_than_it_is(self):
+        report = notes.Report(filled=3, rejected=1, timed_out=6)
+        assert report.kept_rate == 0.75
