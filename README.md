@@ -43,15 +43,46 @@ Useful flags:
 
 ```sh
 recce pkg/ --max-lines 30                 # tighter budget; splits sooner
-recce pkg/ -o /tmp/map.md                 # save it
+recce pkg/ -o /tmp/map.md                 # save it; refuses to clobber
+recce pkg/ -o /tmp/map.md --force         # overwrite one that is already there
 recce pkg/ --stats                        # what it parsed, to stderr
 recce pkg/ --json                         # the intermediate state, not the map
+recce pkg/ --draft                        # a map to save and annotate, not read once
 ```
+
+`--out` will not write over a file that already exists. That is a small
+rudeness when the map is disposable and the only thing standing between you
+and a lost afternoon when it is not — see the draft workflow below.
 
 ## What it is for
 
 Orienting before a deep read. The output is a map, not a reference — the value
 is in what it leaves out, and it will not tell you what the code *means*.
+
+There are two ways that goes, and they want different numbers. Read once on
+screen, the budget is the product: a map running to three screens has failed at
+its only job, and the default 40 lines a block is tuned for that. Saved to a
+file as the starting point for an investigation lasting days — annotated by
+hand as you learn the code — it is a document, and a document is not a
+screenful. `--draft` is the second case:
+
+```sh
+recce pkg/ --draft -o code-map.md         # --max-lines 120, --notes-limit 40
+```
+
+Both are still ordinary flags and either one given explicitly still wins, so
+`--draft --max-lines 60` means 60.
+
+The number is measured rather than chosen. Notes are the first thing the budget
+gives up, so a tight one starves them: on `requests`, 40 requested notes
+rendered 5 at the default, 21 at 80, and all 40 at 120. Past that nothing
+changes — 200 produces a byte-identical map — because the budget has stopped
+binding and no concession fires at all.
+
+Since that file is one you will be writing in, `--out` refuses to overwrite an
+existing one without `--force`. The command that refreshes a draft and the
+command that destroys it are otherwise the same keystrokes, and while the notes
+cache brings recce's own sentences back from disk, nothing brings yours back.
 
 It is not a call-graph dump. `pyan` and `code2flow` already draw every edge, and
 a complete graph of unfamiliar code is as hard to read as the code. recce
@@ -150,14 +181,55 @@ main(argv)  ★
  │   loops over records, accumulates counts and bytes by status and route
 ```
 
-It is off unless you ask — by flag or by `RECCE_MODEL` — and it fails soft. No Ollama, a timeout, a model that is
-not pulled — all of them leave the notes empty and the map renders exactly as
-it does without one.
+It is off unless you ask — by flag or by `RECCE_MODEL` — and it fails soft. No
+Ollama, a refused connection, a model that is not pulled: all of them leave the
+notes empty and the map renders exactly as it does without one. A timeout is
+narrower, because it usually means one function was long rather than that
+anything is wrong, so it costs that note alone and the run carries on; only
+three in a row are read as a server that has stopped answering.
+`--notes-timeout` sets the limit, at 300 seconds by default, which is generous
+for a 7B and about right for a 27B.
 
 The model is shown one function body and asked for one line. It never sees the
 tree, the markers, the budget, or the markdown, so there is no convention for
 it to break and no global reasoning for it to get wrong. That narrowing is why
 a 7B is a plausible tool here and would not be if it were writing the document.
+
+### Bigger models, and thinking ones
+
+A 7B is the default because it is enough for one line and answers in about a
+second. A larger model is worth it when the map is a draft you will live with
+for days rather than a screen you read once — the difference is not in how many
+notes survive the checks, which is near all of them either way, but in how many
+say something. `qwen2.5-coder:7b` described one function as *"loops over
+project modules, functions, and classes, collecting data section bullets"*,
+which restates the name; `qwen3.8:27b` described the same one as *"walks
+modules for dict returns, dataclasses, enums, constants, scalars if empty,
+dedupes"*. Both pass every check. Only one is worth its line.
+
+```sh
+recce pkg/ --draft --model qwen3.8:27b-mlx -o code-map.md
+```
+
+Expect around 20 seconds a note instead of one, so a 40-note draft is a
+quarter of an hour. Against an investigation measured in days that is a good
+trade, and it is cached afterwards.
+
+Two things to know before reaching for one:
+
+- **Anything from Qwen 3.6 on thinks by default**, and reasoning is emitted
+  before the answer. recce sends `think: false` on every request, so this is
+  handled — but it is why it has to. Left on, the token budget for the note is
+  spent entirely on reasoning, the response comes back empty, and every note is
+  rejected for being blank. It reads exactly like a model that cannot write a
+  sentence. Qwen 3.6 also dropped the `/no_think` switch its predecessors took
+  in the prompt, so the API field is the only way left to say it.
+- **The length cap is tuned for a terse model.** A denser one writes past it and
+  gets trimmed at the last clause that fits: `qwen3.8:27b` answered one function
+  in 114 characters, of which 90 survived and *"returns early or builds blocks
+  by strategy"* did not. `--note-chars` raises the cap, and since it is part of
+  the cache key, changing it re-asks rather than serving back answers written to
+  the old one.
 
 ### The static pass fact-checks the model
 
@@ -193,6 +265,19 @@ cut at clause boundaries — dropping whole clauses keeps every survivor exactly
 as true as it was, which cutting mid-sentence would not. And a bland note is
 worse than no note, since it costs a line to say nothing, which is what the
 minimum length is defending against.
+
+With trimming in place the keep rate stopped being the interesting number: over
+twelve candidates each on recce's own source and on `requests`, both
+`qwen2.5-coder:7b` and `qwen3.8:27b` kept all twelve. What separates them is
+whether the sentence earns its line, which no counter measures.
+
+One caveat if you care about reproducibility. Temperature is pinned at zero and
+`qwen2.5-coder:7b` is byte-identical across runs because of it, but that is a
+property of the model rather than of the setting: two identical runs of
+`qwen3.8:27b` disagreed on three notes of twelve. The cache hides this in
+normal use, since the first answer is the one kept, but a `--no-cache` run or a
+changed cache key will reshuffle the wording. It matters if you diff maps; it
+does not if you generate one and annotate it.
 
 ## Environment
 
