@@ -129,3 +129,23 @@ class TestAnExistingOutputFileIsNotClobbered:
 
         monkeypatch.setattr(notes, 'fill', explode)
         assert main([str(target), '--model', 'qwen3.8:27b-mlx', '-o', str(out)]) == 2
+
+
+def test_max_source_chars_defaults_to_the_constant_it_overrides():
+    assert build_parser().parse_args(['pkg']).max_source_chars == notes.MAX_SOURCE_CHARS
+    assert (
+        build_parser()
+        .parse_args(['pkg', '--max-source-chars', '20000'])
+        .max_source_chars
+        == 20000
+    )
+
+
+def test_the_draft_budget_clears_the_larger_codebase():
+    """120 fitted requests and starved rich; 200 fits both.
+
+    Guards the direction rather than the number: a draft budget below what a
+    100-module tree needs is the bug this was, and requests is byte-identical
+    either way so there is nothing pulling the other way.
+    """
+    assert DRAFT_MAX_LINES >= 200

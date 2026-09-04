@@ -19,8 +19,21 @@ than a screen to read:
 python3 -m recce --draft --model qwen3.8:27b-mlx pkg/ -o code-map.md
 ```
 
-Roughly a quarter of an hour for forty notes, cached after. `--draft` is only
-`--max-lines 120 --notes-limit 40`, and either given explicitly still wins.
+`--draft` is only `--max-lines 200 --notes-limit 40`, and either given
+explicitly still wins.
+
+How long that takes is a fact about the machine serving the model, not about
+recce, and the spread is wide enough to matter: forty notes over `rich` took
+2m06s from `qwen2.5-coder:7b` on this laptop, about thirteen minutes from
+`qwen3.8:27b-mlx` on the same laptop, and **eleven seconds** from
+`qwen3.6:35b` on a box with 96GB of VRAM. Any reasoning that starts "notes are
+expensive, so..." is reasoning about the laptop.
+
+```sh
+ssh -N -L 11435:127.0.0.1:11434 dev104 &   # its Ollama binds localhost only
+python3 -m recce --draft --ollama-host http://127.0.0.1:11435 \
+  --model qwen3.6:35b-a3b-coding-mtp-q4_K_M pkg/ -o code-map.md
+```
 
 **Run `./check`, not `uv run pytest`, before calling anything done.** Two
 interpreters are needed and neither run is redundant. The floor catches syntax
@@ -63,11 +76,12 @@ because breaking it makes the map actively misleading rather than merely worse.
 
   Where the budget stops binding is a property of the codebase, not a number
   you can learn once. On `requests` it is 120 — the map at 200 is byte
-  identical. On `rich` it is 200, and at `--draft`'s 120 the concessions are
-  still firing, rendering 14 notes where 200 renders 21. So `--draft` is tuned
-  to requests-scale and under-serves a 100-module tree, and a change to
-  `_CONCESSION_ORDER` is invisible above the knee for whatever tree you happen
-  to test on. Check it at the default, and on something big.
+  identical. On `rich` it is 200. `--draft` was set to 120 off the `requests`
+  measurement alone and under-served a 100-module tree for it, which is why it
+  is 200 now: the default has to clear the larger case, and clearing it costs
+  the smaller one nothing. The general point survives the fix — a change to
+  `_CONCESSION_ORDER` is invisible above the knee of whatever tree you happen
+  to test on, so check it at the default, and on something big.
 
   Above that knee a second ceiling takes over that no budget can lift: `rich`
   renders 8 of 100 modules, so at most 21 of 40 candidates were ever on the
@@ -177,13 +191,17 @@ copies fit the budget. Ninety-nine passing tests never saw it.
   40. Both now cost one note; `_MAX_CONSECUTIVE_FAILURES` in a row is read as a
   wedged server. Count consecutively, never cumulatively — two awkward
   functions in a run of forty are not a dead Ollama.
-- **A function too long to describe is not asked about.** `MAX_SOURCE_CHARS`
-  is the OOM guard above, but it would earn its place without that: nothing
-  6000 characters long compresses into ninety. Bound it in characters, not
-  `loc` — a 135-line function measured 6084 characters while a 137-line one
-  measured 5376, so lines do not predict the wall. `candidates` is oversampled
-  by `_OVERSAMPLE` so a skipped function costs its own slot rather than costing
-  the run a note.
+- **A function too long to ask about is skipped, and the limit is the
+  machine's, not recce's.** `MAX_SOURCE_CHARS` is the OOM guard above. Bound it
+  in characters, not `loc` — a 135-line function measured 6084 characters while
+  a 137-line one measured 5376, so lines do not predict the wall. `candidates`
+  is oversampled by `_OVERSAMPLE` so a skipped function costs its own slot
+  rather than costing the run a note. It was also defended here on the grounds
+  that nothing 6000 characters long compresses into ninety, and that was too
+  strong: asked about rich's 296-line `traverse`, qwen3.6 on a 96GB card
+  answered "recurses on objects, stops at max depth or cycles" in six tenths of
+  a second. Thin, but better than the silence the cap imposes — hence
+  `--max-source-chars` rather than a bigger constant.
 - **`--out` refuses to overwrite.** The check sits beside the target check
   rather than at the write, and it must stay there: a `--draft` run against a
   27B spends a quarter of an hour in the model before there is a byte to write,
