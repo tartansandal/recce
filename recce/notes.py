@@ -19,10 +19,13 @@ Three guardrails matter more than the prompt:
   mid-clause reads as a bug.
 - **Notes are cached by content hash**, so a rerun costs nothing and the same
   code gives the same map. That matters if maps get committed or diffed.
-- **Failure is silent and total.** No Ollama, a timeout, a refused connection,
-  a model that is not pulled — all of them leave `Func.note` empty and the map
-  renders exactly as it does without a model. The notes are an enhancement to
-  something that already stands up.
+- **Failure is silent, and costs only what it has to.** No Ollama, a refused
+  connection, a model that is not pulled — all of them leave every `Func.note`
+  empty and the map renders exactly as it does without a model. A timeout is
+  narrower: it means one function was long, not that the server is gone, so it
+  costs that note alone and the run carries on. Only a run of them in
+  succession is read as the server having stopped answering. The notes are an
+  enhancement to something that already stands up.
 
 Nothing here is imported unless notes are asked for, so recce stays stdlib-only
 in the sense that matters: the default path opens no sockets and reads no cache.
@@ -70,6 +73,15 @@ _PREFERRED_MODELS = (
 
 # Past this the note stops being an annotation and becomes a paragraph
 # competing with the row it hangs under.
+#
+# It is the default rather than the law, because it is tuned to a 7B's terse
+# register and a stronger model writes denser. qwen3.8:27b answered `plan`
+# with 114 characters, of which `_trim` kept 70 and dropped "returns early or
+# builds blocks by strategy" — a clause the reader wanted. `--note-chars`
+# raises it. Everything below takes it as an argument rather than reading the
+# constant, so the cap travels with the question being asked; `_key` folds it
+# into the cache key, so changing it re-asks rather than serving answers
+# written to a different limit.
 MAX_NOTE_CHARS = 90
 
 # Trimming can leave a clause that is true and says nothing — `render` came
@@ -107,6 +119,20 @@ _BRANCH_CLAIM = re.compile(
 
 # Asking about every function is slow and pointless — most rows are plumbing.
 DEFAULT_LIMIT = 12
+
+# Long enough that a slow model on a long function is not mistaken for a dead
+# server. Sixty seconds was written when a note cost a second or two and any
+# wait that long really did mean something was wrong. It does not survive a
+# 27B: qwen3.8 answered `main` (93 lines) in 59.8 seconds, inside the old
+# limit by two tenths of a second and over it under any load at all.
+DEFAULT_TIMEOUT = 300.0
+
+# How many timeouts in a row before the server is presumed wedged rather than
+# merely slow. One timeout is now survivable — see `fill` — but survivable
+# cannot mean unbounded, or a hung Ollama turns a 40-function draft run into
+# forty consecutive full-length waits. Three is enough to distinguish a couple
+# of long functions from a server that has stopped answering.
+_MAX_CONSECUTIVE_TIMEOUTS = 3
 
 PROMPT = """\
 Describe the control flow of this Python function in ONE short line.
@@ -154,20 +180,32 @@ class Report:
     filled: int = 0
     cached: int = 0
     rejected: int = 0
+    timed_out: int = 0
     reasons: Dict[str, int] = field(default_factory=dict)
     error: Optional[str] = None
 
     @property
     def kept_rate(self) -> float:
+        # Timeouts are deliberately absent. A rejection is an answer that was
+        # read and refused, which says something about the model; a timeout is
+        # no answer at all, and folding it in here would report a model as
+        # worse for running on a busy machine.
         answered = self.filled + self.rejected
         return self.filled / float(answered) if answered else 0.0
 
     def summary(self) -> str:
-        if self.error:
+        # Only a run that produced nothing is 'unavailable'. Once a timeout is
+        # survivable a run can end early having already written half its notes,
+        # and reporting that as unavailable would throw away the true count.
+        if self.error and not (self.filled or self.cached):
             return 'notes: unavailable ({})'.format(self.error)
         line = 'notes: {} filled, {} cached, {} rejected of {} asked'.format(
             self.filled, self.cached, self.rejected, self.asked
         )
+        if self.timed_out:
+            line += ', {} timed out'.format(self.timed_out)
+        if self.error:
+            line += '; stopped early: {}'.format(self.error)
         if self.reasons:
             detail = ', '.join(
                 '{} {}'.format(count, reason)
@@ -218,7 +256,9 @@ def _source_of(func: Func) -> Optional[str]:
     return '\n'.join(body) if body else None
 
 
-def _key(model: str, source: str, shape: str = '') -> str:
+def _key(
+    model: str, source: str, shape: str = '', max_chars: int = MAX_NOTE_CHARS
+) -> str:
     """What a cached note is valid for.
 
     `shape` is in here because it is part of the prompt but not part of
@@ -229,12 +269,15 @@ def _key(model: str, source: str, shape: str = '') -> str:
     """
     asked = hashlib.sha256((shape + '\x00' + source).encode('utf-8'))
     return '{}:{}:{}:{}'.format(
-        model, MAX_NOTE_CHARS, _PROMPT_DIGEST, asked.hexdigest()[:24]
+        model, max_chars, _PROMPT_DIGEST, asked.hexdigest()[:24]
     )
 
 
 def why_rejected(
-    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+    raw: str,
+    n_loops: Optional[int] = None,
+    n_branches: Optional[int] = None,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """Name the rule a response broke, or None if it passed.
 
@@ -242,10 +285,10 @@ def why_rejected(
     rejecting. Whether a 29% keep rate means the model is weak or the length
     cap is mean is not a thing to have an opinion about when it can be counted.
     """
-    text = _trim(_reduce(raw))
+    text = _trim(_reduce(raw), max_chars)
     if not text:
         return 'empty'
-    if len(text) > MAX_NOTE_CHARS:
+    if len(text) > max_chars:
         return 'too long'
     if len(text.split()) < 3 or len(text) < MIN_NOTE_CHARS:
         return 'too short'
@@ -272,7 +315,7 @@ def _reduce(raw: str) -> str:
     return ' '.join(text.split())
 
 
-def _trim(text: str) -> str:
+def _trim(text: str, max_chars: int = MAX_NOTE_CHARS) -> str:
     """Drop trailing clauses until the note fits, or give up on it.
 
     This is the one place truncation is allowed, and the distinction is worth
@@ -286,13 +329,13 @@ def _trim(text: str) -> str:
     rather than any fault in the answer, so refusing to trim was throwing away
     most of what the model got right.
     """
-    if len(text) <= MAX_NOTE_CHARS:
+    if len(text) <= max_chars:
         return text
     clauses = text.split(', ')
     kept: list = []
     for clause in clauses:
         candidate = ', '.join(kept + [clause])
-        if len(candidate) > MAX_NOTE_CHARS:
+        if len(candidate) > max_chars:
             break
         kept.append(clause)
     # A single clause over the cap is a run-on, not a list, and there is no
@@ -301,7 +344,10 @@ def _trim(text: str) -> str:
 
 
 def clean(
-    raw: str, n_loops: Optional[int] = None, n_branches: Optional[int] = None
+    raw: str,
+    n_loops: Optional[int] = None,
+    n_branches: Optional[int] = None,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """Reduce a model response to a usable note, or reject it.
 
@@ -321,9 +367,9 @@ def clean(
     there. A reader has no way to catch that from the map alone, which is
     exactly why the map must catch it for them.
     """
-    if why_rejected(raw, n_loops, n_branches) is not None:
+    if why_rejected(raw, n_loops, n_branches, max_chars) is not None:
         return None
-    text = _trim(_reduce(raw))
+    text = _trim(_reduce(raw), max_chars)
     return text[0].lower() + text[1:] if text[:1].isupper() else text
 
 
@@ -394,14 +440,30 @@ def shape_of(func: Func) -> str:
 
 
 def _ask(
-    host: str, model: str, source: str, timeout: float, shape: str = ''
+    host: str,
+    model: str,
+    source: str,
+    timeout: float,
+    shape: str = '',
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Optional[str]:
     """One blocking call to Ollama's generate endpoint."""
     payload = json.dumps(
         {
             'model': model,
-            'prompt': PROMPT.format(source=source, limit=MAX_NOTE_CHARS, shape=shape),
+            'prompt': PROMPT.format(source=source, limit=max_chars, shape=shape),
             'stream': False,
+            # Every Qwen from 3.6 on thinks by default, and the reasoning goes
+            # in front of the answer. `num_predict` below is 60 tokens, so the
+            # thinking consumes the whole budget and `response` comes back
+            # empty or as a truncated fragment of reasoning — `_reduce` then
+            # takes its first line and every note is rejected as 'empty'. The
+            # report says the model is useless when what is wrong is the ask.
+            # Sent unconditionally: Ollama ignores it on models that cannot
+            # think, verified against qwen2.5-coder:7b, which answers normally
+            # rather than erroring. Note that Qwen 3.6 dropped the `/no_think`
+            # soft switch, so this field is the only way left to say it.
+            'think': False,
             'options': {
                 # Zero, not merely low: this is description, not composition,
                 # and a map that changes wording between runs is a map nobody
@@ -423,13 +485,29 @@ def _ask(
     return body.get('response')
 
 
+def _is_timeout(exc: BaseException) -> bool:
+    """Whether this failure was the clock, rather than the server.
+
+    urllib reports the two shapes of timeout differently: a read that runs out
+    of time raises `TimeoutError` directly, while one that times out
+    connecting arrives as a `URLError` carrying it in `reason`. Both mean the
+    same thing here and only the second is wrapped, so the wrapper is unpacked
+    rather than matched on type alone. `socket.timeout` needs no separate case;
+    it has been an alias of `TimeoutError` since 3.10, below the floor.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return isinstance(getattr(exc, 'reason', None), TimeoutError)
+
+
 def fill(
     funcs: Sequence[Func],
     model: str,
     host: str = DEFAULT_HOST,
     limit: int = DEFAULT_LIMIT,
-    timeout: float = 60.0,
+    timeout: float = DEFAULT_TIMEOUT,
     use_cache: bool = True,
+    max_chars: int = MAX_NOTE_CHARS,
 ) -> Report:
     """Write a note onto the functions worth one. Never raises."""
     report = Report()
@@ -446,33 +524,61 @@ def fill(
             cache = {}
 
     dirty = False
+    # Counted in a row, not in total: two slow functions in a forty-function
+    # run are the model being slow, while three in succession are the server
+    # being gone. A cache hit leaves the count alone, having asked nothing.
+    consecutive_timeouts = 0
     for func in chosen:
         source = _source_of(func)
         if source is None:
             continue
         report.asked += 1
         shape = shape_of(func)
-        key = _key(model, source, shape)
+        key = _key(model, source, shape, max_chars)
         if use_cache and key in cache:
             func.note = cache[key]
             report.cached += 1
             continue
         try:
-            raw = _ask(host, model, source, timeout, shape)
+            raw = _ask(host, model, source, timeout, shape, max_chars)
         except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
-            # One failure means the server is gone or the model is not pulled.
-            # Both make every remaining call fail the same way, so stop rather
-            # than wait out the timeout once per function.
+            # A refused socket and a slow generation are not the same failure,
+            # and treating them alike is what made `--draft` produce nothing at
+            # all against a 27B. A connection error really does mean every
+            # remaining call fails the same way, so stopping is right. A
+            # timeout only means this function was long — the next one may be
+            # short — so it costs one note, not the other thirty-nine.
+            if _is_timeout(exc):
+                report.timed_out += 1
+                consecutive_timeouts += 1
+                if consecutive_timeouts < _MAX_CONSECUTIVE_TIMEOUTS:
+                    continue
+                # Slow is survivable; wedged is not. Past this the wait stops
+                # being evidence about one function and starts being evidence
+                # about the server.
+                report.error = 'timed out {} times in a row'.format(
+                    consecutive_timeouts
+                )
+                break
             report.error = str(getattr(exc, 'reason', None) or exc)
             break
+        consecutive_timeouts = 0
         reason = why_rejected(
-            raw or '', n_loops=func.n_loops, n_branches=func.n_branches
+            raw or '',
+            n_loops=func.n_loops,
+            n_branches=func.n_branches,
+            max_chars=max_chars,
         )
         if reason is not None:
             report.rejected += 1
             report.reasons[reason] = report.reasons.get(reason, 0) + 1
             continue
-        note = clean(raw or '', n_loops=func.n_loops, n_branches=func.n_branches)
+        note = clean(
+            raw or '',
+            n_loops=func.n_loops,
+            n_branches=func.n_branches,
+            max_chars=max_chars,
+        )
         func.note = note
         report.filled += 1
         if use_cache:

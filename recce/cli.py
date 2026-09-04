@@ -24,6 +24,23 @@ from .graph import resolve
 from .rank import annotate, plan
 from .render import render
 
+# The budget a map is read on screen with, and the one it is written to a file
+# with, are not the same number. The default is the orientation case: one
+# screen, read once, where a map running to three screens has failed.
+DEFAULT_MAX_LINES = 40
+
+# `--draft` is the other case. The map is generated once for an investigation
+# lasting hours or days, saved, and then edited by hand as the reader learns
+# the code; it is a starting document, not a screenful.
+#
+# 120 is measured, not chosen. `notes` is the first entry in `_CONCESSION_ORDER`,
+# so a tight budget starves it: on requests, 40 asked notes rendered 5 at the
+# default, 21 at 80, and all 40 at 120. Past 120 nothing changes — 200 gives
+# the identical map — because the budget has stopped binding and no concession
+# fires at all. The concession order is not wrong here; the pressure is.
+DRAFT_MAX_LINES = 120
+DRAFT_NOTES_LIMIT = 40
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -35,10 +52,27 @@ def build_parser() -> argparse.ArgumentParser:
         '-o', '--out', type=Path, default=None, help='write to a file instead of stdout'
     )
     parser.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help='overwrite the --out file if it already exists',
+    )
+    parser.add_argument(
         '--max-lines',
         type=int,
-        default=40,
-        help='line budget per fenced tree before the map splits (default: 40)',
+        default=None,
+        help='line budget per fenced tree before the map splits (default: {})'.format(
+            DEFAULT_MAX_LINES
+        ),
+    )
+    parser.add_argument(
+        '--draft',
+        action='store_true',
+        help=(
+            'settings for a map you save and annotate rather than read once: '
+            '--max-lines {} and --notes-limit {}. Either flag given '
+            'explicitly still wins'
+        ).format(DRAFT_MAX_LINES, DRAFT_NOTES_LIMIT),
     )
     parser.add_argument(
         '--base',
@@ -69,10 +103,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--notes-limit',
         type=int,
-        default=notes.DEFAULT_LIMIT,
+        default=None,
         help='how many functions to ask about (default: {})'.format(
             notes.DEFAULT_LIMIT
         ),
+    )
+    parser.add_argument(
+        '--note-chars',
+        type=int,
+        default=notes.MAX_NOTE_CHARS,
+        metavar='N',
+        help=(
+            'longest a note may be before it is trimmed to whole clauses '
+            '(default: {}). Raise it for a model that writes denser than the '
+            'default was tuned for; it is part of the cache key, so a change '
+            're-asks rather than serving answers written to another limit'
+        ).format(notes.MAX_NOTE_CHARS),
+    )
+    parser.add_argument(
+        '--notes-timeout',
+        type=float,
+        default=notes.DEFAULT_TIMEOUT,
+        metavar='SECONDS',
+        help=(
+            'how long one note may take before it is given up on '
+            '(default: {:g}). A timeout costs that note, not the rest of the '
+            'run'
+        ).format(notes.DEFAULT_TIMEOUT),
     )
     parser.add_argument(
         '--ollama-host',
@@ -97,9 +154,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # `--draft` fills in only what was not asked for, so `--draft --max-lines
+    # 60` means 60 rather than silently meaning 120. Both flags default to None
+    # for exactly this: argparse cannot otherwise tell "left alone" from "given
+    # the same value the default happens to be".
+    fallback_lines = DRAFT_MAX_LINES if args.draft else DEFAULT_MAX_LINES
+    fallback_notes = DRAFT_NOTES_LIMIT if args.draft else notes.DEFAULT_LIMIT
+    max_lines = args.max_lines if args.max_lines is not None else fallback_lines
+    notes_limit = args.notes_limit if args.notes_limit is not None else fallback_notes
+
     if not args.target.exists():
         print(
             'recce: no such file or directory: {}'.format(args.target), file=sys.stderr
+        )
+        return 2
+
+    # Checked here rather than at the write, and the distance is the point: a
+    # `--draft` run against a 27B spends a quarter of an hour in the model
+    # before there is anything to write, and refusing after that wait is a
+    # worse answer than refusing before it.
+    #
+    # What `--out` names stopped being disposable when `--draft` arrived. The
+    # map used to be a cheap artifact where an overwrite cost a rerun; a draft
+    # is annotated by hand for days, the notes cache means recce's own
+    # sentences come back, and the reader's marginal ones do not. The refresh
+    # command and the destroy command were the same keystrokes.
+    if args.out and args.out.exists() and not args.force:
+        print(
+            'recce: {} exists; --force to overwrite'.format(args.out), file=sys.stderr
         )
         return 2
 
@@ -138,13 +221,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             project.funcs(),
             model=model,
             host=args.ollama_host,
-            limit=args.notes_limit,
+            limit=notes_limit,
             use_cache=not args.no_cache,
+            max_chars=args.note_chars,
+            timeout=args.notes_timeout,
         )
         if report.error:
             print('recce: {}'.format(report.summary()), file=sys.stderr)
 
-    mapping = plan(project, graph, max_lines=args.max_lines)
+    mapping = plan(project, graph, max_lines=max_lines)
 
     base = str(args.base) if args.base else project.root
     output = (

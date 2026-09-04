@@ -12,6 +12,16 @@ uv run pytest -q -k <name>   # one test
 uv sync                      # build .venv from the lock
 ```
 
+The recipe the flags were added for, when you want a map to work from rather
+than a screen to read:
+
+```sh
+python3 -m recce --draft --model qwen3.8:27b-mlx pkg/ -o code-map.md
+```
+
+Roughly a quarter of an hour for forty notes, cached after. `--draft` is only
+`--max-lines 120 --notes-limit 40`, and either given explicitly still wins.
+
 **Run `./check`, not `uv run pytest`, before calling anything done.** Two
 interpreters are needed and neither run is redundant. The floor catches syntax
 too new to compile. The ceiling catches `ast` API that has since been removed —
@@ -46,6 +56,15 @@ because breaking it makes the map actively misleading rather than merely worse.
   those lines and you have changed what recce gives up first. Notes go before
   rows, because a hidden row is a call the reader never learns about while a
   dropped note only costs a sentence they can get by opening the file.
+
+  `--draft` does not break this rule, it steps outside the case the rule is
+  about: a map read once on screen and a map saved and annotated for days are
+  not the same artifact. Worth knowing before you touch `_CONCESSION_ORDER`,
+  though — under a loose budget it never fires at all. On `requests` the map at
+  `--max-lines 200` is byte-identical to the one at 120, because by 120 there
+  is nothing left to concede. Any change to the order is therefore invisible in
+  draft mode and only observable at the default, which is the opposite of where
+  you would think to look for it.
 - **Model output is checked against the syntax tree.** `notes.py` knows from
   `n_loops` whether a function actually loops, so a note claiming one where
   none exists is not a judgement call but a falsified statement, and it is
@@ -90,6 +109,15 @@ python3 -m recce requests/src/requests > /tmp/base.md
 python3 -m recce requests/src/requests > /tmp/after.md && diff /tmp/base.md /tmp/after.md
 ```
 
+Judging a model needs its own arrangement, because the rendered map is the
+wrong instrument: notes are the first concession, so at the default budget most
+of what a model wrote never reaches the page — 12 asked and 1 rendered on
+`requests`. Compare models by calling `notes.candidates` and `notes._ask`
+directly over the same candidate set and reading the sentences, and keep the
+keep rate in perspective. It has stopped discriminating: both a 7B and a 27B
+keep twelve of twelve on recce and on `requests`, and the whole difference
+between them is in whether the sentence was worth its line.
+
 Every bug that mattered needed a codebase big enough to run out of room. On a
 three-function fixture there is always space for everything, so nothing has to
 be chosen between — and choosing is the whole product. Fixtures cannot catch a
@@ -120,6 +148,29 @@ copies fit the budget. Ninety-nine passing tests never saw it.
   itself — you do not need `--no-cache` for that. What `--no-cache` does is
   skip the cache in *both* directions: it never writes, so a run with it leaves
   the previous entries on disk for the next run without it to serve back.
+- **A thinking model returns nothing unless told not to think.** Every Qwen
+  from 3.6 on reasons by default and puts the reasoning first, so with
+  `num_predict` at 60 the whole budget goes to the thinking and `response`
+  comes back empty — `done_reason` is `length`, `_reduce` takes the first line
+  of nothing, and every note is rejected as `empty`. The report then reads as a
+  verdict on the model. `_ask` sends `think: false` unconditionally; Ollama
+  ignores the field on models that cannot think, verified against
+  `qwen2.5-coder:7b`. Do not gate it on a list of which models reason, and note
+  that 3.6 dropped the `/no_think` prompt switch, so the field is the only way
+  left to say it.
+- **Timeouts are per note, connection errors are per run.** `fill` used to
+  treat them alike and stop on the first failure, which was right when a note
+  cost a second. It is not: `qwen3.8:27b` answers a 93-line function in 59.8
+  seconds, so under the old 60-second default one slow function abandoned every
+  note after it, and `--draft` produced nothing at all against the model it
+  exists for. A timeout now costs its own note; `_MAX_CONSECUTIVE_TIMEOUTS` in
+  a row is read as a wedged server. Count consecutively, never cumulatively —
+  two slow functions in a forty-function run are not a dead Ollama.
+- **`--out` refuses to overwrite.** The check sits beside the target check
+  rather than at the write, and it must stay there: a `--draft` run against a
+  27B spends a quarter of an hour in the model before there is a byte to write,
+  and refusing after that wait is worse than not refusing. There is a test that
+  fails if it drifts down to the write.
 - **`ruff format` runs before you patch by string match.** It rewrites slices
   like `chosen[: 1]` to `chosen[:1]`, which silently breaks a scripted
   `str.replace` against text you read earlier.
