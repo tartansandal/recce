@@ -1,0 +1,174 @@
+#!/bin/sh
+#
+# Generate a corpus of maps over real codebases, for diffing across a change.
+#
+# CLAUDE.md is blunt that a green suite proves nothing about the choices recce
+# makes, because fixtures are too small to run out of room and choosing is the
+# whole product. The stated test is to map real repositories before a change and
+# diff after. This script is that test, made repeatable so it is actually run.
+#
+#   ./corpus /tmp/base      # before the change
+#   ./corpus /tmp/after     # after it
+#   diff -ru /tmp/base /tmp/after
+#
+# Output is split into two directories because the two tiers answer different
+# questions and must not be read the same way.
+#
+# regression/ is the set the constants were tuned against, and it is circular on
+# purpose. httpx produced `_constructor_factor`; flask produced both the
+# `_block_titles` two-`app.py` case and the `flask.cli:main` shim `_pick_spine`
+# skips; requests and rich are the two measurements the default budget was set
+# from. Diffing these answers "did I break a case someone already paid for",
+# which is the only thing a circular set can answer. json, argparse and asyncio
+# sit here too — never tuned against, but read during design, and a target whose
+# output you have already studied can no longer falsify anything. argparse earns
+# its place regardless as the only single-file target, so the only one
+# exercising the entry-split path. recce-repo is this repository's root rather
+# than its package, and it is here for one narrow case: `_select_modules` ranks
+# tests below source only once the module count exceeds the block cap, so a tree
+# with fewer source modules than blocks spends its spare slot on a test module.
+# black-repo covers the opposite side of that threshold, where the ranking works.
+#
+# heldout/ is the set nothing has been tuned against, and its one discipline is
+# that it stays that way. Generating a baseline is fine. Reading the diff once,
+# as a check, is fine. Iterating on a constant until the held-out diff looks
+# good is what destroys it, and at that point it belongs in regression/ and a
+# new held-out set is needed. A change that looks right on regression/ and wrong
+# on heldout/ is overfitting, caught.
+#
+# The held-out repos were picked by measurement, not taste. `./corpus-probe`
+# characterises a codebase on the axes recce's behaviour turns on; run over the
+# candidate pool it showed the regression tier clustered hard in two places, and
+# each repo below is here for the gap it fills:
+#
+#   toolz       24% methods — the most free-function codebase in the pool. The
+#               regression libraries run 69-89% methods, so nothing there
+#               exercises a tree of plain functions.
+#   black       41% methods and the highest median branch count. Dense logic in
+#               a small tree, which is the shape `_score` is most sensitive to.
+#   black-repo  black's repo root rather than its package, so tests sit beside
+#               source. Nothing in regression/ covers `_select_modules` at all:
+#               every target there is a package directory with no tests in it.
+#   sqlalchemy  230 modules, fully docstringed, the most decorated in the pool
+#               at 26%. Large, documented and metaprogramming-heavy at once.
+#   networkx    535 modules, 57% methods, and the highest unresolved-call rate
+#               measured. Algorithmic free-function code at scale, with its
+#               tests interleaved inside the package rather than beside it.
+#   faker       357 near-identical provider modules with 2% carrying a
+#               docstring. A pathologically repetitive shape nothing else has.
+#   yt-dlp      1017 modules, 1% documented. Fifteen times the largest
+#               regression target, which matters because where the budget stops
+#               binding is a property of the tree and rich at 69 modules was the
+#               previous ceiling.
+#   cookiecutter  a small application with straight call chains: one entry
+#               reaches 68% of its functions, the most legible tree in either
+#               tier. Everything else here is a library or too big to walk.
+#   mkdocs      an application recce cannot follow. Its work is dispatched
+#               through a plugin registry, so one entry reaches 3% of it and the
+#               call graph stops at the registry boundary. Apps whose flow is
+#               invisible to static resolution are a shape nothing else covers,
+#               and the pair brackets the range: 3% and 68% are both apps.
+#
+# Three things have to be pinned or the diff fills with noise that is not the
+# change:
+#
+# - `RECCE_MODEL` is unset. Left set to `auto` it turns notes on for every run
+#   in the shell, and notes come from a model that does not answer identically
+#   twice. A corpus with notes in it cannot be diffed.
+# - The interpreter is recorded, not assumed. recce parses with whatever runs
+#   it, so a corpus built on 3.14 and one built on the 3.11 venv are different
+#   measurements of different things and must not be compared.
+# - The checkout of each reference repo is recorded by commit. A corpus is only
+#   comparable to another built from the same sources, and MANIFEST is in the
+#   output so a mismatch shows up in the diff itself rather than being noticed
+#   three hypotheses later.
+
+set -e
+
+root="$(cd "$(dirname "$0")" && pwd)"
+
+out="$1"
+if [ -z "$out" ]; then
+	echo "usage: $0 <output-dir>" >&2
+	exit 2
+fi
+
+# Notes are non-deterministic and would make every diff meaningless. See above.
+unset RECCE_MODEL
+
+# The recce under test is the one in this tree, never an installed copy.
+PYTHONPATH="$root"
+export PYTHONPATH
+
+python="${RECCE_PYTHON:-python3}"
+repos="${RECCE_CORPUS_REPOS:-$HOME/.cache/recce-corpus}"
+stdlib="$("$python" -c 'import json, os; print(os.path.dirname(json.__file__))')"
+
+mkdir -p "$out/regression" "$out/heldout" "$repos"
+
+clone() {
+	if [ ! -d "$repos/$1" ]; then
+		echo "cloning $1"
+		git clone --quiet --depth 1 "$2" "$repos/$1"
+	fi
+}
+
+clone requests https://github.com/psf/requests
+clone rich https://github.com/Textualize/rich
+clone httpx https://github.com/encode/httpx
+clone flask https://github.com/pallets/flask
+clone toolz https://github.com/pytoolz/toolz
+clone black https://github.com/psf/black
+clone sqlalchemy https://github.com/sqlalchemy/sqlalchemy
+clone networkx https://github.com/networkx/networkx
+clone faker https://github.com/joke2k/faker
+clone yt-dlp https://github.com/yt-dlp/yt-dlp
+clone mkdocs https://github.com/mkdocs/mkdocs
+clone cookiecutter https://github.com/cookiecutter/cookiecutter
+
+# MANIFEST carries only what makes two corpora incomparable. Deliberately no
+# timestamp: a date would differ on every run and make every diff dirty.
+{
+	"$python" --version
+	for name in requests rich httpx flask toolz black sqlalchemy networkx faker yt-dlp mkdocs cookiecutter; do
+		echo "$name $(git -C "$repos/$name" rev-parse --short HEAD)"
+	done
+} >"$out/MANIFEST"
+
+# tier<TAB>name<TAB>path. Smallest first within each tier, so a broken run fails
+# fast on a cheap target rather than a minute into yt-dlp.
+targets="
+regression	json	$stdlib
+regression	recce	$root/recce
+regression	recce-repo	$root
+regression	argparse	$stdlib/../argparse.py
+regression	requests	$repos/requests/src/requests
+regression	httpx	$repos/httpx/httpx
+regression	flask	$repos/flask/src/flask
+regression	asyncio	$stdlib/../asyncio
+regression	rich	$repos/rich/rich
+heldout	cookiecutter	$repos/cookiecutter/cookiecutter
+heldout	toolz	$repos/toolz/toolz
+heldout	black	$repos/black/src/black
+heldout	black-repo	$repos/black
+heldout	sqlalchemy	$repos/sqlalchemy/lib/sqlalchemy
+heldout	mkdocs	$repos/mkdocs/mkdocs
+heldout	faker	$repos/faker/faker
+heldout	networkx	$repos/networkx/networkx
+heldout	yt-dlp	$repos/yt-dlp/yt_dlp
+"
+
+echo "$targets" | while IFS="	" read -r tier name path; do
+	[ -z "$tier" ] && continue
+	echo "mapping $tier/$name"
+	# --stats goes to stderr and reports what parsed rather than what was
+	# chosen, which is what tells a surprising diff apart from a broken one.
+	"$python" -m recce "$path" --base "$path" --stats \
+		>"$out/$tier/$name.default.md" 2>"$out/$tier/$name.default.stats"
+	"$python" -m recce "$path" --base "$path" --draft --stats \
+		>"$out/$tier/$name.draft.md" 2>"$out/$tier/$name.draft.stats"
+done
+
+echo
+echo "corpus written to $out"
+echo "diff against another with: diff -ru <other> $out"

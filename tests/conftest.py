@@ -32,11 +32,11 @@ def write_tree(root: Path, files: dict) -> Path:
 def build(tmp_path):
     """Run the whole pipeline over a written tree and hand back every stage."""
 
-    def _build(files: dict, target: str = '.', max_lines: int = 40):
+    def _build(files: dict, target: str = '.', max_lines: int = 40, kind=None):
         write_tree(tmp_path, files)
         project = discover(tmp_path / target)
         graph = resolve(project)
-        mapping = plan(project, graph, max_lines=max_lines)
+        mapping = plan(project, graph, max_lines=max_lines, kind=kind)
         text = render(project, mapping, base=str(tmp_path))
         return project, graph, mapping, text
 

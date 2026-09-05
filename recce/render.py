@@ -14,12 +14,62 @@ document, so a reader meeting one of these for the first time is never guessing.
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Optional
 
 from .model import Func, Project
 from .rank import Block, Node, Plan
 
-LEGEND = '★ read first · ~ skim · `[brackets]` = external'
+LEGEND_HEADING = '## Legend'
+
+# Every mark the trees can carry, with what finds it and what it says. Listed
+# in the order a reader meets them: which row to read, then what a row is
+# telling you, then what has been abbreviated, then what points elsewhere.
+#
+# It is built from the marks actually on the page rather than printed whole.
+# The old one-line legend explained the three rarest — `★` appears 149 times
+# across the corpus, `◆` 59 and `~` 22 — and left out the three commonest: the
+# return arrow at 1076, `↑` at 381 and `…` at 228. Fixing that by listing all
+# nine would spend nine lines of a ninety-line map on marks it does not use, so
+# each entry has to earn its line by being on the page.
+_LEGEND = (
+    (re.compile('★'), '`★` start here — the row this block is read from'),
+    (
+        re.compile('◆'),
+        '`◆` densest logic — where the decisions sit, when that is not the way in',
+    ),
+    (re.compile(r'\s~(\s|$)', re.M), '`~` skim — little to learn here'),
+    (re.compile('─→'), '`─→` returns'),
+    (
+        re.compile(r'\(\.\.\.\)'),
+        '`(...)` — three or more parameters, elided; the map is about flow',
+    ),
+    (
+        re.compile('↑'),
+        '`↑` shown above — the same call, already expanded earlier in this block',
+    ),
+    (
+        re.compile('…'),
+        '`…` more — trivial helpers folded into one row, or rows cut to fit',
+    ),
+    (
+        re.compile(r'\[[^\]]+\]\s*$', re.M),
+        '`[name]` external — a call leaving the project, named by its package',
+    ),
+    (
+        re.compile(r'^[\s│├└─]*[A-Za-z_][\w.]*\.[A-Za-z_]\w*\(\)(  ↑)?\s*$', re.M),
+        "`mod.func()` — the call crosses a file; that file's own block expands it",
+    ),
+)
+
+
+def legend_for(trees: str) -> List[str]:
+    """The legend for one map: the marks on its pages and nothing else."""
+    entries = [line for pattern, line in _LEGEND if pattern.search(trees)]
+    if not entries:
+        return []
+    return [LEGEND_HEADING, ''] + ['- {}'.format(entry) for entry in entries]
+
 
 # Where the bracket annotations line up, and the hard stop past which a row is
 # left ragged rather than pushed off the side of a terminal.
@@ -76,8 +126,23 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
         if plan.omitted_modules:
             note += ', {} further modules not shown'.format(plan.omitted_modules)
         lines.append(note + '.')
+        if plan.omitted_tests:
+            # Said separately from the count above, because it is a different
+            # fact with a different answer. Source that did not fit wants a
+            # bigger budget; tests are absent because this is a map of the
+            # source, and the reader who wants them has to ask for a different
+            # map rather than a longer one.
+            lines.append('')
+            lines.append(
+                '{} test {} not mapped here; point recce at them for a map '
+                'of the suite.'.format(
+                    plan.omitted_tests,
+                    'module is' if plan.omitted_tests == 1 else 'modules are',
+                )
+            )
         lines.append('')
 
+    trees: List[str] = []
     for index, block in enumerate(plan.blocks, start=1):
         if plan.strategy != 'single':
             heading = '## [{}] {}'.format(index, block.title)
@@ -85,8 +150,13 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
                 heading += ' — {}'.format(block.purpose)
             lines.append(heading)
             lines.append('')
+        rows = _render_block(block)
+        # Kept apart from `lines` so the legend is built from the trees alone.
+        # Read off the whole document it would find its own examples and list
+        # every mark every time.
+        trees.extend(rows)
         lines.append('```')
-        lines.extend(_render_block(block))
+        lines.extend(rows)
         lines.append('```')
         lines.append('')
 
@@ -97,10 +167,22 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
         lines.extend(data)
         lines.append('')
 
-    if plan.strategy != 'single' and plan.spine:
+    # The starred rows, in block order. This section and the `★` in the fences
+    # have to name the same functions or the document argues with itself, and
+    # naming where to start is what the heading has always promised. The
+    # score-ranked list lives on as `◆` inside the trees, where it answers the
+    # other question — which function carries the weight — without claiming to
+    # be the way in.
+    #
+    # Ordered by call depth rather than by block, because the blocks are already
+    # in dependency order and a list repeating it is a second table of contents.
+    # Depth puts the ways in first, which is the ordering the heading promises.
+    leads = [b.roots[0].func for b in plan.blocks if b.roots and b.roots[0].func]
+    leads.sort(key=lambda f: (f.depth if f.depth is not None else 99, f.module))
+    if plan.strategy != 'single' and leads:
         lines.append('## Spine to read first')
         lines.append('')
-        for position, func in enumerate(plan.spine[:5], start=1):
+        for position, func in enumerate(leads[:5], start=1):
             lines.append(
                 '{}. `{}:{} :: {}`'.format(
                     position, _relative(func.path, base), func.lineno, func.qualname
@@ -108,7 +190,7 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
             )
         lines.append('')
 
-    lines.append(LEGEND)
+    lines.extend(legend_for('\n'.join(trees)))
     return '\n'.join(lines).rstrip() + '\n'
 
 
@@ -182,7 +264,9 @@ def _walk(
 def _row_text(node: Node) -> str:
     """The text of one row, before any bracket alignment."""
     if node.func is None:
-        return node.label
+        # A reference leaf carries its own repeat marker: it has no `func` to
+        # hang the usual one off, and it is the row most likely to arrive twice.
+        return node.label + ('  ↑' if node.repeat else '')
 
     text = '{}({})'.format(node.func.qualname, _args_of(node.func))
     if node.ret and not node.repeat:

@@ -87,6 +87,17 @@ def build_parser() -> argparse.ArgumentParser:
         help='directory paths in the map are relative to (default: the target)',
     )
     parser.add_argument(
+        '--type',
+        dest='kind',
+        choices=('app', 'lib', 'test'),
+        default=None,
+        help=(
+            'what this tree is, when recce cannot tell: app draws the flow '
+            'across modules, lib shows per-file blocks only, test maps the '
+            'suite as the subject (default: inferred)'
+        ),
+    )
+    parser.add_argument(
         '--json',
         action='store_true',
         help='dump the intermediate state instead of the map',
@@ -245,7 +256,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # to err on: asking about a row that later drops costs one note, while
         # excluding one that would have stayed loses it for good.
         rendered = {
-            notes.key_of(f) for f in rendered_funcs(plan(project, graph, max_lines))
+            notes.key_of(f)
+            for f in rendered_funcs(plan(project, graph, max_lines, args.kind))
         }
         report = notes.fill(
             project.funcs(),
@@ -263,7 +275,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if report.error and not args.stats:
             print('recce: {}'.format(report.summary()), file=sys.stderr)
 
-    mapping = plan(project, graph, max_lines=max_lines)
+    mapping = plan(project, graph, max_lines=max_lines, kind=args.kind)
 
     base = str(args.base) if args.base else project.root
     output = (
@@ -287,11 +299,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if report is not None:
             print('recce: {}'.format(report.summary()), file=sys.stderr)
         print(
-            'recce: {} modules, {} functions, {} blocks, strategy={}'.format(
+            'recce: {} modules, {} functions, {} blocks, strategy={}, type={}'.format(
                 len(project.modules),
                 len(project.funcs()),
                 len(mapping.blocks),
                 mapping.strategy,
+                # Said plainly because it is the one input recce cannot read off
+                # the tree, so a map that surprises should show whether it was
+                # told or left to infer.
+                args.kind if args.kind else 'inferred',
             ),
             file=sys.stderr,
         )

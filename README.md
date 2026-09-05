@@ -12,15 +12,23 @@ sent to a hosted model.
 # with_docstring.py — Parse and summarize webserver access logs
 
 main(argv)  ★
- ├─ parse_line(line)  ★
+ ├─ parse_line(line)  ◆
  │   └─ … _parse_bytes
- ├─ summarize(records)  ★
+ ├─ summarize(records)  ◆
  │   └─ Counter()                           [collections]
  ├─ format_summary(s)
  │   └─ … _human_bytes
  └─ … _parse_args, _read_input              [argparse, pathlib]
+```
 
-★ read first · ~ skim · [brackets] = external
+Every map ends with a legend, listing the marks that appear on that page and
+no others:
+
+```
+- `★` start here — the row this block is read from
+- `◆` densest logic — where the decisions sit, when that is not the way in
+- `…` more — trivial helpers folded into one row, or rows cut to fit
+- `[name]` external — a call leaving the project, named by its package
 ```
 
 ## Running it
@@ -49,6 +57,8 @@ recce pkg/ --stats                        # what it parsed, to stderr
 recce pkg/ --json                         # the intermediate state, not the map
 recce pkg/ --draft                        # a map to save and annotate, not read once
 recce pkg/ --max-source-chars 20000       # ask about long functions too, given the memory
+recce pkg/ --type app                     # draw the flow across modules; lib, test also
+
 ```
 
 `--out` will not write over a file that already exists. That is a small
@@ -87,6 +97,39 @@ existing one without `--force`. The command that refreshes a draft and the
 command that destroys it are otherwise the same keystrokes, and while the notes
 cache brings recce's own sentences back from disk, nothing brings yours back.
 
+A package of more than two modules is drawn as one block per file, which
+answers what each file holds and not how they fit together — every call leaving
+a module becomes a reference leaf the block cannot follow. So where a project
+declares how it is run, in `[project.scripts]`, the map opens with that flow
+drawn across the modules it touches:
+
+```
+## [1] main() across 6 modules
+```
+
+It is bought rather than added: a flow needing three blocks' worth of lines
+displaces three per-file blocks, and the modules that lose their place are
+counted in the note at the top. A project that does not declare an entry point
+gets no such block, because the alternative is picking whichever deep function
+happens to touch the most files and calling it the way in.
+
+`--type` is how you say what the tree cannot. Plenty of applications declare no
+console script — `httpie`, `flake8` and `pre-commit` among them — and plenty of
+libraries declare one for a CLI they ship on the side, so there is no reading of
+the code that tells the two apart. `--type app` draws the flow anyway, on the
+best way in recce can find; `--type lib` says there is no one flow worth
+leading with and asks for per-file blocks only.
+
+`--type test` answers the other question a mixed tree cannot: pointed at a
+repository root holding both source and tests, recce maps the source, and this
+maps the suite instead. It is the exact mirror — the default keeps source and
+drops tests, this keeps tests and drops source — because a map that is half of
+each serves neither reader. Pointed at a directory of tests, no flag is needed;
+tests are all there is and they are the subject already.
+
+`--stats` reports which of these was in force, as `type=app` or `type=inferred`,
+so a map that surprises you says whether it was told or left to guess.
+
 It is not a call-graph dump. `pyan` and `code2flow` already draw every edge, and
 a complete graph of unfamiliar code is as hard to read as the code. recce
 filters: trivial helpers collapse into a `…` row, external calls are pushed to
@@ -113,6 +156,21 @@ expect. What recce can *read* is decided by the interpreter it runs on, not by
 are all unreadable; run the same code on 3.14 and they are fine. **Run recce on
 the newest Python you have**, whatever it was built against. When files do fail
 to parse the map says so at the top rather than quietly leaving them out.
+
+A short list of external calls is left out on purpose rather than missed:
+`itertools`, `functools`, `operator`, `gettext`, `logging`, `typing`, and the
+path arithmetic in `os.path` — `join`, `basename`, `dirname`, `splitext` and
+their neighbours. Everything else keeps its bracket, including the rest of
+`os`: `os.stat`, `os.remove`, `environ.get`, and `pathlib` in full.
+
+The list is short because it was measured rather than reasoned out. Each entry
+is there because removing it made room for something worth more — dropping these
+freed 96 rows across a corpus of fifteen codebases, and what moved in included
+the whole of `rich`'s traceback rendering. `collections` looks like it belongs
+and does not: dropping it costs 44 `Counter` and `defaultdict` rows and buys
+back little. Where a call is borderline it keeps its bracket, on the same
+grounds as everything else here — a row you never see is a cost you cannot
+notice, and a row you did not need is one line.
 
 The purpose line has a rule of its own. It comes from the module docstring, a
 README in that exact directory, or a top-of-file comment block — and from
@@ -147,8 +205,10 @@ whether you can point this at something on a whim:
 
 Cost is nearly all parsing, so it scales with source read rather than with
 anything recce decides. Pointing it at a tree that large is a misuse — you get
-eight blocks and a note saying 1860 modules were not shown — but it will not
-fall over, and it says what it left out.
+eight blocks and a note accounting for the many hundreds of modules that are
+not shown — but it will not fall over, and it says what it left out. That note
+separates the two reasons a module is missing: source that did not fit, and
+test modules, which are not mapped alongside source at all.
 
 ## Notes, from a local model
 

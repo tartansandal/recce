@@ -14,7 +14,10 @@ filtering is the product, so the choices here are the ones to argue with:
 - **When to split.** The budget is a real constraint, not a suggestion, and a
   map that quietly runs to three screens has failed at its one job. So the tree
   is pruned down a fixed ladder, and when the bottom of that ladder still does
-  not fit, the map splits instead of shrinking further.
+  not fit, the map splits instead of shrinking further. Past that a tree is cut
+  to size and says how much went: the ladder only trades depth, and a wide tree
+  reaches the bottom of it still over budget, so without the cut the constraint
+  held everywhere except where it was binding.
 
 Nothing here reads a function body's meaning. `Func.note` stays empty; that is
 the slot a model fills in later.
@@ -122,6 +125,9 @@ class Block:
     title: str
     purpose: Optional[str]
     roots: List[Node] = field(default_factory=list)
+    # Drawn across module boundaries rather than being one module's block, so
+    # it is not a module the omission counts should account for.
+    spanning: bool = False
 
     def line_count(self) -> int:
         return sum(root.line_count() for root in self.roots)
@@ -136,6 +142,9 @@ class Plan:
     spine: List[Func] = field(default_factory=list)
     entries: List[Func] = field(default_factory=list)
     omitted_modules: int = 0
+    # Test modules left out because this is a map of the source. Counted apart
+    # from `omitted_modules`, which is source that did not fit.
+    omitted_tests: int = 0
 
 
 def annotate(project: Project, graph: Graph) -> List[Func]:
@@ -148,6 +157,86 @@ def annotate(project: Project, graph: Graph) -> List[Func]:
     return entries
 
 
+# The first tier that is a reading of the graph rather than a fact about the
+# code. Everything at or past it is ordered by reach instead of by tier.
+_INFERRED = 3
+
+# The one tier that is a statement rather than a reading: a `[project.scripts]`
+# target names an executable, in a manifest, on purpose. It is the only evidence
+# the spanning block will build on.
+_DECLARED = 0
+
+# The `__main__`-guard tier. Trusted for naming a way in and not for leading a
+# document, because in library code a guard usually marks a demo rather than
+# the program: rich carries 43 of them, one at the foot of each module it can
+# show off, and building the spanning block on those picked a private method of
+# the traceback renderer as how rich fits together.
+_GUARD = 1
+
+# How deep a flow is followed when measuring what an entry point leads to.
+# Matches the deepest rung of `_DEPTH_LADDER`, so reach measures the tree a
+# reader could actually be shown rather than one the budget would never render.
+_REACH_DEPTH = 6
+
+
+def _reach_sets(funcs: Sequence[Func], graph: Graph) -> Dict[str, Set[str]]:
+    """For each function, everything a reader following it would arrive at.
+
+    Bounded rather than transitive-closed: past `_REACH_DEPTH` the reader has
+    left the flow the block is describing, so counting further would rank an
+    entry by code it leads to only in principle.
+    """
+    sets: Dict[str, Set[str]] = {}
+    for func in funcs:
+        seen: Set[str] = set()
+        frontier = [(func.node_id, 0)]
+        while frontier:
+            node_id, depth = frontier.pop(0)
+            if node_id in seen or depth > _REACH_DEPTH:
+                continue
+            seen.add(node_id)
+            for callee in graph.callees(node_id):
+                frontier.append((callee, depth + 1))
+        sets[func.node_id] = seen
+    return sets
+
+
+def declared_ways_in(project: Project, graph: Graph) -> Dict[str, int]:
+    """Ways in the code states, keyed by node id, valued by which tier said so.
+
+    A `[project.scripts]` target, a `__main__` guard and a framework decorator
+    are facts: the code is telling you how it is run. Everything else recce
+    calls an entry point is read off the graph, where "nothing calls it" cannot
+    be told from "nothing calls it yet".
+
+    The distinction is worth its own function because the two are not
+    interchangeable. Ordering a list of candidates tolerates a wrong guess —
+    the reader sees a slightly odd second row. Leading the whole document with
+    one does not, so `_spanning_block` will only build on these.
+    """
+    tiers: Dict[str, int] = {}
+
+    def offer(func: Optional[Func], rank: int) -> None:
+        if func is not None and func.node_id not in tiers:
+            tiers[func.node_id] = rank
+
+    for declared in project.declared_entries:
+        offer(_resolve_declared(declared, project), 0)
+
+    by_id = project.by_id()
+    for module in project.modules.values():
+        for target in graph.entry_calls.get(module.name, []):
+            offer(by_id.get(target), 1)
+
+    for func in by_id.values():
+        tails = func.decorator_tails
+        if any(d in _NON_ENTRY_DECORATORS for d in tails):
+            continue
+        if any(d in _ENTRY_DECORATORS for d in tails):
+            offer(func, 2)
+    return tiers
+
+
 def _entry_points(project: Project, graph: Graph) -> List[Func]:
     """Find the ways in, best evidence first.
 
@@ -156,6 +245,20 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
     neither exists do we fall back to graph shape, where "nothing in the
     project calls it" is suggestive but routinely wrong — an unused helper
     looks identical to an entry point from the graph alone.
+
+    Which is exactly why the three inference tiers are ordered by reach and not
+    by their own shape. They used to break ties on branch count, and on library
+    code that picks the wrong thing every time: an uncalled utility with six
+    branches outranks `api.get`, whose body is one delegation. requests came out
+    as `help.main` and six `utils` helpers, with `api.get` tenth and
+    `Session.request` absent for the crime of having callers. Reach is the
+    measure that separates the two cases the docstring above admits look
+    identical — a way in leads into the system, an unused helper leads nowhere —
+    and it puts `Session.get` first, reaching 37 functions across 7 modules.
+
+    Evidence still beats inference: a declared script, a `__main__` guard and a
+    framework decorator keep their tiers, because those are facts about the code
+    rather than readings of its shape. Reach only orders what is left.
     """
     by_id = project.by_id()
     ranked: List[Tuple[int, str, Func]] = []
@@ -166,22 +269,17 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
             seen.add(func.node_id)
             ranked.append((rank, func.node_id, func))
 
-    for declared in project.declared_entries:
-        offer(_resolve_declared(declared, project), 0)
+    # The tiers where the code says how it is run, rather than where recce
+    # reads it off the graph. Kept apart because more than one caller needs to
+    # know which of the two a way in came from.
+    for node_id, rank in declared_ways_in(project, graph).items():
+        offer(by_id.get(node_id), rank)
 
-    for module in project.modules.values():
-        for target in graph.entry_calls.get(module.name, []):
-            offer(by_id.get(target), 1)
-
-    # One pass, in rank order: `offer` keeps the first rank a function is
-    # given, so checking the declared ways in before the graph-shape fallback
-    # is what makes a decorated entry point outrank its own lack of callers.
     for func in by_id.values():
         tails = func.decorator_tails
         if any(d in _NON_ENTRY_DECORATORS for d in tails):
             continue
-        if any(d in _ENTRY_DECORATORS for d in tails):
-            offer(func, 2)
+        if func.node_id in seen:
             continue
         if func.name == 'main' and not func.is_method:
             offer(func, 3)
@@ -192,7 +290,18 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
         # object rather than a record; a dataclass field accessor is not.
         offer(func, 4 if not func.is_method else 5)
 
-    ranked.sort(key=lambda item: (item[0], -item[2].n_branches, item[1]))
+    reach = _reach_sets([func for _, _, func in ranked], graph)
+    # `min(rank, _INFERRED)` collapses the three graph-shape tiers into one.
+    # Ranking a public function above a public method was never evidence about
+    # which is the way in, and it is what buried `Session.get` beneath every
+    # uncalled helper in `utils`.
+    ranked.sort(
+        key=lambda item: (
+            min(item[0], _INFERRED),
+            -len(reach[item[2].node_id]),
+            item[1],
+        )
+    )
     return [func for _, _, func in ranked]
 
 
@@ -415,6 +524,20 @@ def _pick_spine(
     tells them to start in the middle. The rest go to the highest-scoring
     functions that are actually reachable, because starring dead code is worse
     than starring nothing.
+
+    Score here, where `_module_roots` and `_ensure_block_spine` use reach, and
+    the difference is deliberate. A block root answers "what does the rest of
+    this block hang off"; the project spine answers "where is the logic worth
+    reading", and those are not the same question. Filling this list by reach
+    was tried and broke two defences at once: `format_summary` reaches
+    `_human_bytes` and so outranks `summarize`, undoing `_presentation_factor`,
+    and on flat code every candidate reaches one function, so the tie-break
+    decides and a two-line `click.main()` shim reaches the spine.
+
+    The cost is that a block can lead with one function and star another —
+    `rank.py` leads with `plan` and stars `_build_tree` inside it. That reads as
+    "start here, the weight is there", which is worth more than making one
+    marker mean two things.
     """
     chosen: List[Func] = []
     # The first entry point is where execution starts, which is not always
@@ -478,6 +601,7 @@ def _build_tree(
     graph: Graph,
     depth_cap: int = 6,
     emitted: Optional[Set[str]] = None,
+    referenced: Optional[Set[str]] = None,
     members: Optional[Set[str]] = None,
     drop_skim: bool = False,
     external_depth: int = 99,
@@ -487,6 +611,8 @@ def _build_tree(
     by_id = project.by_id()
     if emitted is None:
         emitted = set()
+    if referenced is None:
+        referenced = set()
 
     def expand(func: Func, depth: int, path: Set[str]) -> Node:
         node = Node(
@@ -512,11 +638,28 @@ def _build_tree(
                     # the point of splitting by module rather than by accident.
                     # It becomes a reference leaf — named the way the calling
                     # file writes it — and the callee's own block expands it.
+                    #
+                    # Marked `↑` on every appearance after the first, the way a
+                    # repeated call inside the block is. Without it the same
+                    # name arrives looking like news each time: four of
+                    # requests' rows in one block are `_types.is_prepared()`,
+                    # and nothing distinguished them from four different calls.
+                    #
+                    # This runs before the trivial check, and the asymmetry is
+                    # deliberate. Collapsing a one-line helper into `…` is right
+                    # inside a module, where the row would say nothing; a row
+                    # naming another file says which file, which is the one
+                    # thing a per-module block cannot otherwise tell you.
+                    # Folding those in too was tried and saves four rows across
+                    # the whole corpus, which does not pay for an edge out of
+                    # the block going unnamed.
                     reference = '{}.{}()'.format(
                         callee.module.rsplit('.', 1)[-1], callee.qualname
                     )
                     if not any(c.label == reference for c in node.children):
-                        node.children.append(Node(label=reference))
+                        seen_before = callee.node_id in referenced
+                        referenced.add(callee.node_id)
+                        node.children.append(Node(label=reference, repeat=seen_before))
                     continue
                 if any(c.func is callee for c in node.children):
                     continue
@@ -599,10 +742,27 @@ def _note_for(func: Func, mode: str) -> Optional[str]:
 
 def _marker_for(func: Func) -> str:
     if func.role == SPINE:
-        return '★'
+        return '◆'
     if func.role == SKIM:
         return '~'
     return ''
+
+
+def _mark_lead(roots: List[Node]) -> List[Node]:
+    """Star the first row of a block: the row to start reading at.
+
+    Two markers because the block's way in and its densest function are not
+    reliably the same row, and one marker cannot say both. Where they are the
+    same — 41 of the 49 starred blocks in the corpus — this overwrites the
+    diamond and the block looks exactly as it always did. Where they differ it
+    is the case worth telling apart: `rank.py` leads with `plan` and its weight
+    is in `_build_tree` four levels down, and a single star had to choose
+    between sending the reader to a row they cannot read first and saying
+    nothing about where the work is.
+    """
+    if roots and roots[0].func is not None:
+        roots[0].marker = '★'
+    return roots
 
 
 def _fit(
@@ -611,6 +771,7 @@ def _fit(
     graph: Graph,
     max_lines: int,
     members: Optional[Set[str]] = None,
+    truncate: bool = True,
 ) -> List[Node]:
     """Expand roots into trees, pruning down a ladder until they fit.
 
@@ -623,15 +784,33 @@ def _fit(
     prefix of root trees that fits. Dropping a whole flow is dearer than
     anything on the ladder, so it is genuinely last.
 
-    Something always comes back. If even one root is over budget, that is what
-    ships, because a map that is four lines too long is a worse failure than
-    no map at all only in a spec.
+    Past that the last root is cut to fit rather than shipped over budget. It
+    used to ship, on the grounds that a map four lines too long beats no map,
+    and the overage turned out not to be four lines: every concession on the
+    ladder trades away depth, and the trees that reach the bottom of it are
+    wide, not deep. All fifteen blocks that came out over budget across the
+    corpus were at the tightest depth already, and yt-dlp's `_real_extract`
+    rendered 114 rows against a budget of 40. A budget missed by that much is
+    not a budget.
+
+    `truncate=False` is for a caller that needs the natural size rather than a
+    fitted one — `_spanning_block` sizes a flow by how many block slots it
+    would take, and a tree cut to one slot always looks like it takes one.
     """
     attempt: List[Node] = []
     for rung in _rungs():
         emitted: Set[str] = set()
+        referenced: Set[str] = set()
         attempt = [
-            _build_tree(root, project, graph, emitted=emitted, members=members, **rung)
+            _build_tree(
+                root,
+                project,
+                graph,
+                emitted=emitted,
+                referenced=referenced,
+                members=members,
+                **rung,
+            )
             for root in roots
         ]
         if sum(n.line_count() for n in attempt) <= max_lines:
@@ -643,7 +822,51 @@ def _fit(
     trimmed = _prefix_within(attempt, max_lines)
     if trimmed:
         return trimmed
-    return attempt[:1]
+    if not truncate:
+        return attempt[:1]
+    return [_truncate(attempt[0], max_lines)]
+
+
+def _truncate(node: Node, budget: int) -> Node:
+    """Cut a tree down to `budget` rows, saying how many went.
+
+    Whole child subtrees, from the end, rather than a clean slice through the
+    rows: a tree missing its last three branches is still a tree, where one cut
+    mid-branch leaves rows indented under a parent that is no longer there.
+
+    The count is exact and the row saying it is inside the budget, because a
+    reader who cannot see that something was dropped has been misled rather
+    than economised on — the same reason a module that did not fit is counted
+    in the note at the top of the map.
+    """
+    if node.line_count() <= budget:
+        return node
+    own = 1 + (1 if node.note else 0)
+    if own >= budget:
+        node.children = []
+        return node
+
+    # Something is going to be dropped, so the row that says so is reserved up
+    # front rather than clawed back afterwards.
+    room = budget - own - 1
+    kept: List[Node] = []
+    rest = list(node.children)
+    while rest and room > 0:
+        child = rest.pop(0)
+        if child.line_count() > room:
+            # Cut into it rather than stopping at it. Keeping only whole
+            # subtrees sounds tidier and spends the budget badly: yt-dlp's
+            # widest block has two one-line children and then a large one, so
+            # stopping gave three rows of a possible forty and a note saying 42
+            # things were dropped.
+            child = _truncate(child, room)
+        kept.append(child)
+        room -= child.line_count()
+
+    node.children = kept
+    if rest:
+        node.children.append(Node(label='… {} more'.format(len(rest))))
+    return node
 
 
 def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
@@ -659,7 +882,9 @@ def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
     return kept
 
 
-def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
+def plan(
+    project: Project, graph: Graph, max_lines: int = 40, kind: Optional[str] = None
+) -> Plan:
     """Build the whole map structure, splitting if it will not fit.
 
     Whatever comes out of the bottom of `_fit`'s ladder still over budget gets
@@ -675,9 +900,8 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     roots = _roots_for(entries, project, graph)
     if _wants_module_split(project):
         result.strategy = 'module'
-        result.blocks = _module_blocks(project, graph, max_lines)
-        with_funcs = sum(1 for m in project.modules.values() if m.funcs)
-        result.omitted_modules = max(with_funcs - len(result.blocks), 0)
+        result.blocks = _blocks_with_spanning(project, graph, max_lines, kind)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result, kind)
         return result
 
     nodes = _fit(roots, project, graph, max_lines)
@@ -688,19 +912,221 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
         # rule. Filling them in here meant picking an arbitrary module out of
         # a dict and calling its docstring the whole map's purpose, which was
         # invisible only because nothing read it back.
-        result.blocks = [Block(title='', purpose=None, roots=nodes)]
+        result.blocks = [Block(title='', purpose=None, roots=_mark_lead(nodes))]
         return result
 
     result.strategy = 'module' if len(project.modules) > 1 else 'entry'
     result.blocks = (
-        _module_blocks(project, graph, max_lines)
+        _blocks_with_spanning(project, graph, max_lines, kind)
         if result.strategy == 'module'
         else _entry_blocks(project, graph, roots, max_lines)
     )
     if result.strategy == 'module':
-        with_funcs = sum(1 for m in project.modules.values() if m.funcs)
-        result.omitted_modules = max(with_funcs - len(result.blocks), 0)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result, kind)
     return result
+
+
+# Past eight blocks the document stops being a map and becomes a listing.
+_MAX_BLOCKS = 8
+
+# What a spanning block has to be worth to take one of those eight slots from a
+# module. Fewer modules than this and it is a module block wearing a different
+# heading; fewer rows and it is a heading with nothing under it. Three rather
+# than two because httpx's flow crossed exactly one boundary and led the map
+# with a tree that a module block would have shown nearly as well.
+_SPANNING_MIN_MODULES = 3
+_SPANNING_MIN_ROWS = 5
+
+# The most block slots one flow may buy. Past half the document the map has
+# stopped being a map of the package and become one flow with offcuts.
+_SPANNING_MAX_SLOTS = 4
+
+# How much fragmentation has to be on the page before a flow drawn across the
+# modules is worth the slot it takes from one. Set from the gap in the measured
+# distribution: the code-map fixture cuts 2 calls, networkx 3 and json 4, and
+# none of them is fragmented — networkx's blocks are independent algorithm
+# modules that barely call each other. The next value up is recce at 10, then
+# toolz 12, requests 40, black 60, yt-dlp 150, all of which are spending real
+# rows on calls they cannot follow.
+_SPANNING_MIN_STUBS = 10
+
+
+def _iter_nodes(node: Node):
+    yield node
+    for child in node.children:
+        yield from _iter_nodes(child)
+
+
+def _blocks_with_spanning(
+    project: Project, graph: Graph, max_lines: int, kind: Optional[str] = None
+) -> List[Block]:
+    """Module blocks, led by one flow drawn across them where there is one.
+
+    A map of per-module blocks answers what each file contains and never
+    answers how they fit together, because every call leaving a module is cut
+    to an unexpanded reference leaf — 17% of rendered rows on requests and 40%
+    on yt-dlp are those stubs. One block drawn with no `members` restriction
+    follows a flow wherever it goes, which is the view the rest of the document
+    cannot give.
+
+    It has to earn the slot it takes, so it is built first and kept only if it
+    spans real ground. Where a codebase has no flow crossing a module boundary
+    the block is not built and the map is exactly as it was.
+    """
+    modules = _module_blocks(project, graph, max_lines, _MAX_BLOCKS, kind)
+    if kind in ('lib', 'test'):
+        # `lib` says there is no one flow to lead with, `test` that the subject
+        # is a suite whose modules seldom share one. Either way the answer is
+        # the per-file blocks, and asking is cheaper than recce guessing.
+        return modules
+    if kind != 'app' and _stub_rows(modules) < _SPANNING_MIN_STUBS:
+        # Nothing is being cut apart, so there is nothing to draw together. A
+        # small package whose blocks already show the whole flow gets the map it
+        # got before, rather than a fourth heading restating the other three.
+        #
+        # Skipped under `--type app`, because this is a guess about whether the
+        # block is worth having and the reader has just answered that question.
+        # The floors in `_spanning_block` still apply: they are about whether
+        # there is a flow at all, which no flag can assert into existence.
+        return modules
+    spanning = _spanning_block(project, graph, max_lines, kind)
+    if spanning is None:
+        return modules
+    slots = -(-spanning.line_count() // max_lines)
+    return [spanning] + _module_blocks(project, graph, max_lines, _MAX_BLOCKS - slots)
+
+
+def _stub_rows(blocks: Sequence[Block]) -> int:
+    """Rows that name a call leaving the block and cannot follow it.
+
+    This is the cost the spanning block exists to offset, so it is also what
+    decides whether that block is worth a slot. A reference leaf has no `func`
+    to expand and no bracket, and carries a dotted name written the way the
+    calling file writes it.
+    """
+    return sum(
+        1
+        for block in blocks
+        for root in block.roots
+        for node in _iter_nodes(root)
+        if node.func is None and not node.bracket and '.' in node.label
+    )
+
+
+def _spanning_block(
+    project: Project, graph: Graph, max_lines: int, kind: Optional[str] = None
+) -> Optional[Block]:
+    """The one flow worth drawing across module boundaries, or nothing.
+
+    Built only on a way in the code declares — a console script, a `__main__`
+    guard, a framework decorator. Any inferred entry point will do to order a
+    list, and will not do to lead a document. Allowing them produced a block on
+    every large library, and on a library there is no dominant flow to find, so
+    what led the map was whichever deep function happened to touch the most
+    files: `Provider.ascii_company_email` for faker,
+    `_SubqueryLoader.create_row_processor` for sqlalchemy, one downloader of
+    hundreds for yt-dlp. Each was presented, by position, as how the package
+    fits together. That is the guessed purpose line again in another costume.
+
+    So where a project does not say how it is run, there is no spanning block
+    and the map is the module blocks alone. `--type app` is the way to say it
+    anyway when the entry point is one recce cannot see.
+
+    Only `_DECLARED`, and the two weaker tiers are excluded for reasons worth
+    keeping. A `__main__` guard marks a demo as readily as a program — see
+    `_GUARD`. A framework decorator is a name match and nothing more: rich's
+    `Traceback._render_stack` is decorated `@group`, which is in
+    `_ENTRY_DECORATORS` and means "combine these renderables" rather than
+    "something calls this", and it led rich's map until this was narrowed. Ways
+    in that live in a test module are excluded too, which `_select_modules`
+    already does for the module blocks and which this door bypassed.
+
+    Among what remains, the one reaching the most modules wins. That is also
+    what stops a wrapper leading: black declares both `main` and
+    `patched_main`, and the wrapper reaches six modules where the function it
+    wraps reaches ten.
+    """
+    tests = {m.name for m in project.modules.values() if _is_test_module(m)}
+    ways_in = declared_ways_in(project, graph)
+    by_id = project.by_id()
+    if kind == 'app':
+        # The reader has asserted what the manifest does not say, which is the
+        # case this flag exists for: httpie, flake8 and pre-commit all declare
+        # no console script, so the strict gate leaves them with no way to ask.
+        # Every entry point is a candidate, and the reach ordering below picks
+        # among them — the risk of an arbitrary pick is the reader's to take,
+        # having said this is an application.
+        pool = {f.node_id for f in _entry_points(project, graph)}
+    else:
+        pool = {n for n, tier in ways_in.items() if tier == _DECLARED}
+    candidates = [by_id[n] for n in pool if n in by_id and by_id[n].module not in tests]
+    if not candidates:
+        return None
+    reach = _reach_sets(candidates, graph)
+
+    def spans(func: Func) -> int:
+        return len({by_id[n].module for n in reach[func.node_id] if n in by_id})
+
+    root = max(candidates, key=lambda f: (spans(f), len(reach[f.node_id]), f.node_id))
+    if spans(root) < _SPANNING_MIN_MODULES:
+        return None
+    # Buy as many block slots as the flow needs, cheapest first. One slot is
+    # one module's worth of budget, so a three-slot block displaces three module
+    # blocks and the document stays bounded by `_MAX_BLOCKS * max_lines` exactly
+    # as before — the flow is paid for in modules, not in extra length.
+    #
+    # It has to be bought rather than pruned because the pruning ladder cannot
+    # reach these trees. Every concession on it trades away depth, and a
+    # whole-program flow is wide: recce's is 106 lines at the tightest rung
+    # available and cookiecutter's 62, unchanged by anything `_fit` can do. A
+    # flat one-slot budget kept only the two that happened to fit and dropped
+    # both of the ones worth having.
+    nodes = None
+    for slots in range(1, _SPANNING_MAX_SLOTS + 1):
+        attempt = _fit([root], project, graph, slots * max_lines, truncate=False)
+        if attempt[0].line_count() <= slots * max_lines:
+            nodes = attempt
+            break
+    if nodes is None:
+        return None
+    drawn = {n.func.module for n in _iter_nodes(nodes[0]) if n.func is not None}
+    if len(drawn) < _SPANNING_MIN_MODULES or nodes[0].line_count() < _SPANNING_MIN_ROWS:
+        return None
+    return Block(
+        title='{}() across {} modules'.format(root.qualname, len(drawn)),
+        purpose=root.doc,
+        roots=_mark_lead(nodes),
+        spanning=True,
+    )
+
+
+def _omissions(
+    project: Project, result: Plan, kind: Optional[str] = None
+) -> Tuple[int, int]:
+    """What is missing from the map, split by why it is missing.
+
+    Two reasons a module has no block, and the reader needs them apart. One is
+    that it did not fit, and the answer is a tighter target or a bigger budget.
+    The other is that it is a test module and this is a map of the source, where
+    the answer is to point recce at the tests instead. Reporting them as one
+    number sends a reader looking for source that was never missing.
+    """
+    with_funcs = [m for m in project.modules.values() if m.funcs]
+    tests = sum(1 for m in with_funcs if _is_test_module(m))
+    source = len(with_funcs) - tests
+    # The spanning block is a flow, not a module, so it does not reduce the
+    # count of modules still unshown.
+    shown = sum(1 for b in result.blocks if not b.spanning)
+    if kind == 'test':
+        # The suite is the subject and the source was set aside on purpose, so
+        # what is missing is the test modules that did not fit. Source is not
+        # counted as absent: the reader asked for it to be.
+        return max(tests - shown, 0), 0
+    if not source:
+        # Nothing but tests in the tree, so they are the subject by default and
+        # are not an omission either.
+        return max(len(with_funcs) - shown, 0), 0
+    return max(source - shown, 0), tests
 
 
 # Below this, a package reads better as one tree: the flow across two files is
@@ -717,17 +1143,47 @@ def _wants_module_split(project: Project) -> bool:
 
 
 def _roots_for(entries: Sequence[Func], project: Project, graph: Graph) -> List[Func]:
-    """Tree roots for a single-block map: the entries, or the best guess."""
-    if entries:
-        return list(entries[:4])
-    funcs = project.funcs()
-    if not funcs:
-        return []
-    return [max(funcs, key=lambda f: f.score)]
+    """Tree roots for a single-block map: complementary flows, best first.
+
+    Taking the top four entries showed the same flow four times. requests ranks
+    `Session.delete`, `Session.get`, `Session.head` and `Session.options`
+    together — four public methods that each reach the same 37 functions,
+    because each one delegates to `Session.request` and the work is downstream
+    of that. Four spellings of one flow is not four flows.
+
+    So after the first, each root is the entry that reaches the most functions
+    *not already shown*. An entry adding nothing new is a different name for a
+    map the reader already has, and is skipped rather than spent on a root.
+
+    The first root is taken in rank order rather than by coverage, because a
+    declared script or a `__main__` guard is where the program actually starts
+    and that outranks how much of the project it happens to touch.
+    """
+    if not entries:
+        funcs = project.funcs()
+        return [max(funcs, key=lambda f: f.score)] if funcs else []
+
+    reach = _reach_sets(entries, graph)
+    chosen = [entries[0]]
+    covered = set(reach[entries[0].node_id])
+    while len(chosen) < 4:
+        remaining = [f for f in entries if f not in chosen]
+        if not remaining:
+            break
+        best = max(remaining, key=lambda f: len(reach[f.node_id] - covered))
+        if not reach[best.node_id] - covered:
+            break
+        chosen.append(best)
+        covered |= reach[best.node_id]
+    return chosen
 
 
 def _module_blocks(
-    project: Project, graph: Graph, max_lines: int, max_blocks: int = 8
+    project: Project,
+    graph: Graph,
+    max_lines: int,
+    max_blocks: int = _MAX_BLOCKS,
+    kind: Optional[str] = None,
 ) -> List[Block]:
     """One block per module, leaves first, capped at what a reader will read.
 
@@ -740,14 +1196,14 @@ def _module_blocks(
     knows they are seeing eight modules of thirty can go and ask for the rest.
     """
     blocks: List[Block] = []
-    chosen = _select_modules(project, max_blocks)
+    chosen = _select_modules(project, max_blocks, kind)
     titles = _block_titles([project.modules[n].path for n in chosen])
     for name in chosen:
         module = project.modules[name]
         if not module.funcs:
             continue
         members = {f.node_id for f in module.funcs}
-        _ensure_block_spine(module.funcs)
+        _ensure_block_spine(module.funcs, _block_coverage(module, graph))
         roots = _module_roots(module, graph)
         # Each block is deliberately self-contained: a function shown in an
         # earlier block is still shown here, because a reader who jumps to one
@@ -758,23 +1214,26 @@ def _module_blocks(
             Block(
                 title=titles[module.path],
                 purpose=module.doc or module.header_comment,
-                roots=nodes,
+                roots=_mark_lead(nodes),
             )
         )
     return blocks
 
 
-def _ensure_block_spine(funcs: Sequence[Func]) -> None:
-    """Star the best function in a block that has none.
+def _ensure_block_spine(funcs: Sequence[Func], covers) -> None:
+    """Star the way into a block that has no star yet.
 
-    A block is a map in its own right, and one with no star tells the reader
-    to start anywhere. The overall spine list stays capped separately, so this
-    only affects the markers inside the fence.
+    A block is a map in its own right, and one with no star tells the reader to
+    start anywhere. The marker says "read first", so it goes to the function the
+    rest of the block hangs off rather than the one holding the most branches —
+    the same measure `_module_roots` picks its root by, and for the same reason.
+    The overall spine list stays capped separately, so this only affects the
+    markers inside the fence.
     """
     candidates = [f for f in funcs if f.role != TRIVIAL]
     if not candidates or any(f.role == SPINE for f in candidates):
         return
-    max(candidates, key=lambda f: (f.score, -f.lineno)).role = SPINE
+    max(candidates, key=lambda f: (covers(f), -f.lineno)).role = SPINE
 
 
 def _block_titles(paths: Sequence[str]) -> Dict[str, str]:
@@ -815,29 +1274,46 @@ def _is_test_module(module) -> bool:
     )
 
 
-def _select_modules(project: Project, max_blocks: int) -> List[str]:
+def _select_modules(
+    project: Project, max_blocks: int, kind: Optional[str] = None
+) -> List[str]:
     """Which modules get a block, in the order they should be read.
 
-    Tests are ranked below source when the slots run out. They are kept in the
-    walk on purpose — a test suite is often the clearest statement of what code
-    is for — but a project with three modules and three test modules should not
-    spend half its map on the tests. Pointed at a test directory, where tests
-    are all there is, nothing is deprioritised and they fill the map as they
-    should.
+    Mapping a package to understand the package and mapping a test suite to
+    understand the suite are two jobs, and one document cannot do both — a map
+    that is mostly source with two test blocks bolted on serves neither reader.
+    So the tree decides which job this is: where there is source, the map is of
+    the source and test modules are not eligible for a block at all; where there
+    is nothing but tests, the tests are the subject and fill the map as they
+    should. The selector is the path recce was pointed at, which is why
+    `pkg/` and `pkg/tests/` give two different and equally correct maps.
+
+    This used to be a ranking rather than an exclusion, and ranking cannot
+    express it. Tests sorted last still take any slot the source does not fill,
+    so a repository with seven source modules and eight slots spent its eighth
+    on a test file; and the sort only ran when the modules outnumbered the
+    slots, so a project with three of each — the case this docstring has always
+    used as the thing that must not happen — returned all six untouched.
     """
     order = [n for n in _module_order(project) if project.modules[n].funcs]
-    if len(order) <= max_blocks:
-        return order
-    has_source = any(not _is_test_module(project.modules[n]) for n in order)
+    source = [n for n in order if not _is_test_module(project.modules[n])]
+    # `--type test` says the suite is the subject even where source sits beside
+    # it, which is the one case the tree cannot show: a repository root holds
+    # both, and only the reader knows which they came to read. It mirrors the
+    # default exactly — the default keeps source and drops tests, this keeps
+    # tests and drops source — because a map that mixed them would be the
+    # half-of-each document neither reader wants.
+    if kind == 'test':
+        eligible = [n for n in order if _is_test_module(project.modules[n])] or order
+    else:
+        eligible = source or order
+    if len(eligible) <= max_blocks:
+        return eligible
     ranked = sorted(
-        order,
-        key=lambda n: (
-            has_source and _is_test_module(project.modules[n]),
-            -max(f.score for f in project.modules[n].funcs),
-        ),
+        eligible, key=lambda n: -max(f.score for f in project.modules[n].funcs)
     )
     keep = set(ranked[:max_blocks])
-    return [n for n in order if n in keep]
+    return [n for n in eligible if n in keep]
 
 
 def _module_roots(module, graph: Graph) -> List[Func]:
@@ -857,7 +1333,8 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     roots = [f for f in module.funcs if f.node_id not in internal]
     substantial = [f for f in roots if f.role != TRIVIAL]
     chosen = substantial or roots
-    chosen.sort(key=lambda f: (-f.score, f.lineno))
+    covers = _block_coverage(module, graph)
+    chosen.sort(key=lambda f: (-covers(f), f.lineno))
 
     # Being uncalled is what makes something a way in, but it is not what
     # makes it worth reading, and in a class-heavy module the two come apart
@@ -870,17 +1347,42 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     # in httpx's `_client.py` out of the roots while the constructors led.
     # The module's best-scoring function is promoted when nothing else would
     # have put it near the top.
-    best = _best_in(module.funcs)
+    best = _best_in(module.funcs, covers)
     if best is not None and best not in chosen[:2]:
         chosen.insert(0, best)
 
     return chosen or sorted(module.funcs, key=lambda f: f.lineno)[:1]
 
 
-def _best_in(funcs: Sequence[Func]) -> Optional[Func]:
-    """The function in a module most worth reading, trivia excluded."""
+def _block_coverage(module, graph: Graph):
+    """How much of this module's own code each of its functions leads to.
+
+    The measure a block wants is not the same one a star wants. Score asks
+    which function holds the most decisions; a block root has to ask which one
+    the rest of the block hangs off, and those come apart exactly where it
+    matters. `rank.py` scored `_build_tree` above `plan`, so the block for the
+    module this tool is built around led with a private helper and `plan`
+    appeared below it or, once it grew, not at all. `render.py` led with
+    `_data_section` rather than `render`.
+
+    Restricted to the module's own functions because a block is drawn with
+    `members` set: a callee in another module renders as an unexpanded
+    reference leaf, so reach that leaves the module buys no rows here and
+    should not decide which root leads.
+    """
+    members = {f.node_id for f in module.funcs}
+    reach = _reach_sets(module.funcs, graph)
+
+    def covers(func: Func) -> int:
+        return len(reach[func.node_id] & members)
+
+    return covers
+
+
+def _best_in(funcs: Sequence[Func], covers) -> Optional[Func]:
+    """The function a block is most usefully read from, trivia excluded."""
     candidates = [f for f in funcs if f.role != TRIVIAL]
-    return max(candidates, key=lambda f: (f.score, -f.lineno)) if candidates else None
+    return max(candidates, key=lambda f: (covers(f), -f.lineno)) if candidates else None
 
 
 def _entry_blocks(
@@ -895,7 +1397,7 @@ def _entry_blocks(
             Block(
                 title='{}() flow'.format(root.qualname),
                 purpose=root.doc,
-                roots=[node],
+                roots=_mark_lead([node]),
             )
         )
     return blocks
