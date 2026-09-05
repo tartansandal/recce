@@ -60,6 +60,14 @@
 #               regression target, which matters because where the budget stops
 #               binding is a property of the tree and rich at 69 modules was the
 #               previous ceiling.
+#   cookiecutter  a small application with straight call chains: one entry
+#               reaches 68% of its functions, the most legible tree in either
+#               tier. Everything else here is a library or too big to walk.
+#   mkdocs      an application recce cannot follow. Its work is dispatched
+#               through a plugin registry, so one entry reaches 3% of it and the
+#               call graph stops at the registry boundary. Apps whose flow is
+#               invisible to static resolution are a shape nothing else covers,
+#               and the pair brackets the range: 3% and 68% are both apps.
 #
 # Three things have to be pinned or the diff fills with noise that is not the
 # change:
@@ -115,12 +123,14 @@ clone sqlalchemy https://github.com/sqlalchemy/sqlalchemy
 clone networkx https://github.com/networkx/networkx
 clone faker https://github.com/joke2k/faker
 clone yt-dlp https://github.com/yt-dlp/yt-dlp
+clone mkdocs https://github.com/mkdocs/mkdocs
+clone cookiecutter https://github.com/cookiecutter/cookiecutter
 
 # MANIFEST carries only what makes two corpora incomparable. Deliberately no
 # timestamp: a date would differ on every run and make every diff dirty.
 {
 	"$python" --version
-	for name in requests rich httpx flask toolz black sqlalchemy networkx faker yt-dlp; do
+	for name in requests rich httpx flask toolz black sqlalchemy networkx faker yt-dlp mkdocs cookiecutter; do
 		echo "$name $(git -C "$repos/$name" rev-parse --short HEAD)"
 	done
 } >"$out/MANIFEST"
@@ -137,10 +147,12 @@ regression	httpx	$repos/httpx/httpx
 regression	flask	$repos/flask/src/flask
 regression	asyncio	$stdlib/../asyncio
 regression	rich	$repos/rich/rich
+heldout	cookiecutter	$repos/cookiecutter/cookiecutter
 heldout	toolz	$repos/toolz/toolz
 heldout	black	$repos/black/src/black
 heldout	black-repo	$repos/black
 heldout	sqlalchemy	$repos/sqlalchemy/lib/sqlalchemy
+heldout	mkdocs	$repos/mkdocs/mkdocs
 heldout	faker	$repos/faker/faker
 heldout	networkx	$repos/networkx/networkx
 heldout	yt-dlp	$repos/yt-dlp/yt_dlp
