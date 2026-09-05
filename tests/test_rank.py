@@ -379,9 +379,22 @@ def test_the_best_function_is_shown_even_when_something_calls_it(build):
     }
     _, _, mapping, _ = build(files, 'pkg')
     block = next(b for b in mapping.blocks if b.title == 'a.py')
-    assert block.roots[0].func.qualname == 'Client.send', [
+
+    def walk(node):
+        yield node
+        for child in node.children:
+            yield from child.walk() if hasattr(child, 'walk') else walk(child)
+
+    shown = {n.func.qualname for r in block.roots for n in walk(r) if n.func}
+    # The root is whatever leads furthest into the block, which here is the
+    # public method rather than the worker it delegates to — and that is a
+    # better answer than the worker, because the reader gets the way in and the
+    # work below it. What must not happen is the block leading with a
+    # constructor while the work never appears at all.
+    assert not block.roots[0].func.name.startswith('__'), [
         r.func.qualname for r in block.roots
     ]
+    assert 'Client.send' in shown, shown
 
 
 def test_a_declared_entry_point_outranks_every_inference(build):

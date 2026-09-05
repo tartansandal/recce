@@ -151,6 +151,38 @@ def annotate(project: Project, graph: Graph) -> List[Func]:
     return entries
 
 
+# The first tier that is a reading of the graph rather than a fact about the
+# code. Everything at or past it is ordered by reach instead of by tier.
+_INFERRED = 3
+
+# How deep a flow is followed when measuring what an entry point leads to.
+# Matches the deepest rung of `_DEPTH_LADDER`, so reach measures the tree a
+# reader could actually be shown rather than one the budget would never render.
+_REACH_DEPTH = 6
+
+
+def _reach_sets(funcs: Sequence[Func], graph: Graph) -> Dict[str, Set[str]]:
+    """For each function, everything a reader following it would arrive at.
+
+    Bounded rather than transitive-closed: past `_REACH_DEPTH` the reader has
+    left the flow the block is describing, so counting further would rank an
+    entry by code it leads to only in principle.
+    """
+    sets: Dict[str, Set[str]] = {}
+    for func in funcs:
+        seen: Set[str] = set()
+        frontier = [(func.node_id, 0)]
+        while frontier:
+            node_id, depth = frontier.pop(0)
+            if node_id in seen or depth > _REACH_DEPTH:
+                continue
+            seen.add(node_id)
+            for callee in graph.callees(node_id):
+                frontier.append((callee, depth + 1))
+        sets[func.node_id] = seen
+    return sets
+
+
 def _entry_points(project: Project, graph: Graph) -> List[Func]:
     """Find the ways in, best evidence first.
 
@@ -159,6 +191,20 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
     neither exists do we fall back to graph shape, where "nothing in the
     project calls it" is suggestive but routinely wrong — an unused helper
     looks identical to an entry point from the graph alone.
+
+    Which is exactly why the three inference tiers are ordered by reach and not
+    by their own shape. They used to break ties on branch count, and on library
+    code that picks the wrong thing every time: an uncalled utility with six
+    branches outranks `api.get`, whose body is one delegation. requests came out
+    as `help.main` and six `utils` helpers, with `api.get` tenth and
+    `Session.request` absent for the crime of having callers. Reach is the
+    measure that separates the two cases the docstring above admits look
+    identical — a way in leads into the system, an unused helper leads nowhere —
+    and it puts `Session.get` first, reaching 37 functions across 7 modules.
+
+    Evidence still beats inference: a declared script, a `__main__` guard and a
+    framework decorator keep their tiers, because those are facts about the code
+    rather than readings of its shape. Reach only orders what is left.
     """
     by_id = project.by_id()
     ranked: List[Tuple[int, str, Func]] = []
@@ -195,7 +241,18 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
         # object rather than a record; a dataclass field accessor is not.
         offer(func, 4 if not func.is_method else 5)
 
-    ranked.sort(key=lambda item: (item[0], -item[2].n_branches, item[1]))
+    reach = _reach_sets([func for _, _, func in ranked], graph)
+    # `min(rank, _INFERRED)` collapses the three graph-shape tiers into one.
+    # Ranking a public function above a public method was never evidence about
+    # which is the way in, and it is what buried `Session.get` beneath every
+    # uncalled helper in `utils`.
+    ranked.sort(
+        key=lambda item: (
+            min(item[0], _INFERRED),
+            -len(reach[item[2].node_id]),
+            item[1],
+        )
+    )
     return [func for _, _, func in ranked]
 
 
@@ -418,6 +475,20 @@ def _pick_spine(
     tells them to start in the middle. The rest go to the highest-scoring
     functions that are actually reachable, because starring dead code is worse
     than starring nothing.
+
+    Score here, where `_module_roots` and `_ensure_block_spine` use reach, and
+    the difference is deliberate. A block root answers "what does the rest of
+    this block hang off"; the project spine answers "where is the logic worth
+    reading", and those are not the same question. Filling this list by reach
+    was tried and broke two defences at once: `format_summary` reaches
+    `_human_bytes` and so outranks `summarize`, undoing `_presentation_factor`,
+    and on flat code every candidate reaches one function, so the tie-break
+    decides and a two-line `click.main()` shim reaches the spine.
+
+    The cost is that a block can lead with one function and star another —
+    `rank.py` leads with `plan` and stars `_build_tree` inside it. That reads as
+    "start here, the weight is there", which is worth more than making one
+    marker mean two things.
     """
     chosen: List[Func] = []
     # The first entry point is where execution starts, which is not always
@@ -736,13 +807,39 @@ def _wants_module_split(project: Project) -> bool:
 
 
 def _roots_for(entries: Sequence[Func], project: Project, graph: Graph) -> List[Func]:
-    """Tree roots for a single-block map: the entries, or the best guess."""
-    if entries:
-        return list(entries[:4])
-    funcs = project.funcs()
-    if not funcs:
-        return []
-    return [max(funcs, key=lambda f: f.score)]
+    """Tree roots for a single-block map: complementary flows, best first.
+
+    Taking the top four entries showed the same flow four times. requests ranks
+    `Session.delete`, `Session.get`, `Session.head` and `Session.options`
+    together — four public methods that each reach the same 37 functions,
+    because each one delegates to `Session.request` and the work is downstream
+    of that. Four spellings of one flow is not four flows.
+
+    So after the first, each root is the entry that reaches the most functions
+    *not already shown*. An entry adding nothing new is a different name for a
+    map the reader already has, and is skipped rather than spent on a root.
+
+    The first root is taken in rank order rather than by coverage, because a
+    declared script or a `__main__` guard is where the program actually starts
+    and that outranks how much of the project it happens to touch.
+    """
+    if not entries:
+        funcs = project.funcs()
+        return [max(funcs, key=lambda f: f.score)] if funcs else []
+
+    reach = _reach_sets(entries, graph)
+    chosen = [entries[0]]
+    covered = set(reach[entries[0].node_id])
+    while len(chosen) < 4:
+        remaining = [f for f in entries if f not in chosen]
+        if not remaining:
+            break
+        best = max(remaining, key=lambda f: len(reach[f.node_id] - covered))
+        if not reach[best.node_id] - covered:
+            break
+        chosen.append(best)
+        covered |= reach[best.node_id]
+    return chosen
 
 
 def _module_blocks(
@@ -766,7 +863,7 @@ def _module_blocks(
         if not module.funcs:
             continue
         members = {f.node_id for f in module.funcs}
-        _ensure_block_spine(module.funcs)
+        _ensure_block_spine(module.funcs, _block_coverage(module, graph))
         roots = _module_roots(module, graph)
         # Each block is deliberately self-contained: a function shown in an
         # earlier block is still shown here, because a reader who jumps to one
@@ -783,17 +880,20 @@ def _module_blocks(
     return blocks
 
 
-def _ensure_block_spine(funcs: Sequence[Func]) -> None:
-    """Star the best function in a block that has none.
+def _ensure_block_spine(funcs: Sequence[Func], covers) -> None:
+    """Star the way into a block that has no star yet.
 
-    A block is a map in its own right, and one with no star tells the reader
-    to start anywhere. The overall spine list stays capped separately, so this
-    only affects the markers inside the fence.
+    A block is a map in its own right, and one with no star tells the reader to
+    start anywhere. The marker says "read first", so it goes to the function the
+    rest of the block hangs off rather than the one holding the most branches —
+    the same measure `_module_roots` picks its root by, and for the same reason.
+    The overall spine list stays capped separately, so this only affects the
+    markers inside the fence.
     """
     candidates = [f for f in funcs if f.role != TRIVIAL]
     if not candidates or any(f.role == SPINE for f in candidates):
         return
-    max(candidates, key=lambda f: (f.score, -f.lineno)).role = SPINE
+    max(candidates, key=lambda f: (covers(f), -f.lineno)).role = SPINE
 
 
 def _block_titles(paths: Sequence[str]) -> Dict[str, str]:
@@ -882,7 +982,8 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     roots = [f for f in module.funcs if f.node_id not in internal]
     substantial = [f for f in roots if f.role != TRIVIAL]
     chosen = substantial or roots
-    chosen.sort(key=lambda f: (-f.score, f.lineno))
+    covers = _block_coverage(module, graph)
+    chosen.sort(key=lambda f: (-covers(f), f.lineno))
 
     # Being uncalled is what makes something a way in, but it is not what
     # makes it worth reading, and in a class-heavy module the two come apart
@@ -895,17 +996,42 @@ def _module_roots(module, graph: Graph) -> List[Func]:
     # in httpx's `_client.py` out of the roots while the constructors led.
     # The module's best-scoring function is promoted when nothing else would
     # have put it near the top.
-    best = _best_in(module.funcs)
+    best = _best_in(module.funcs, covers)
     if best is not None and best not in chosen[:2]:
         chosen.insert(0, best)
 
     return chosen or sorted(module.funcs, key=lambda f: f.lineno)[:1]
 
 
-def _best_in(funcs: Sequence[Func]) -> Optional[Func]:
-    """The function in a module most worth reading, trivia excluded."""
+def _block_coverage(module, graph: Graph):
+    """How much of this module's own code each of its functions leads to.
+
+    The measure a block wants is not the same one a star wants. Score asks
+    which function holds the most decisions; a block root has to ask which one
+    the rest of the block hangs off, and those come apart exactly where it
+    matters. `rank.py` scored `_build_tree` above `plan`, so the block for the
+    module this tool is built around led with a private helper and `plan`
+    appeared below it or, once it grew, not at all. `render.py` led with
+    `_data_section` rather than `render`.
+
+    Restricted to the module's own functions because a block is drawn with
+    `members` set: a callee in another module renders as an unexpanded
+    reference leaf, so reach that leaves the module buys no rows here and
+    should not decide which root leads.
+    """
+    members = {f.node_id for f in module.funcs}
+    reach = _reach_sets(module.funcs, graph)
+
+    def covers(func: Func) -> int:
+        return len(reach[func.node_id] & members)
+
+    return covers
+
+
+def _best_in(funcs: Sequence[Func], covers) -> Optional[Func]:
+    """The function a block is most usefully read from, trivia excluded."""
     candidates = [f for f in funcs if f.role != TRIVIAL]
-    return max(candidates, key=lambda f: (f.score, -f.lineno)) if candidates else None
+    return max(candidates, key=lambda f: (covers(f), -f.lineno)) if candidates else None
 
 
 def _entry_blocks(
