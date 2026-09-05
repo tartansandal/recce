@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from recce.render import LEGEND
+from recce.render import LEGEND_HEADING
 
 SAMPLE = {
     'a.py': '''
@@ -65,9 +65,39 @@ def test_external_calls_are_bracketed(build):
     assert re.search(r'\[argparse\]|\[pathlib\]', text)
 
 
-def test_the_legend_is_the_last_line(build):
+def test_the_legend_closes_the_document(build):
     _, _, _, text = build(SAMPLE, 'a.py')
-    assert text.rstrip().endswith(LEGEND)
+    body, _, legend = text.rstrip().partition(LEGEND_HEADING)
+    assert legend, text
+    assert LEGEND_HEADING not in body
+    assert all(
+        line.startswith('- ') for line in legend.strip().splitlines() if line.strip()
+    )
+
+
+def test_the_legend_names_only_the_marks_on_the_page(build):
+    """A legend listing marks the map does not use is reference, not a key.
+
+    The one-line legend it replaced had the opposite fault: it named the three
+    rarest marks and left out the return arrow, which is the commonest thing in
+    any recce map.
+    """
+    annotated = dict(SAMPLE)
+    annotated['b.py'] = (
+        '"""Q."""\n\n\ndef sized(xs) -> int:\n    total = 0\n'
+        '    for x in xs:\n        if x:\n            total += 1\n    return total\n'
+    )
+    for files in (SAMPLE, annotated):
+        _, _, _, text = build(files, '.')
+        trees = '\n'.join(re.findall(r'```\n(.*?)```', text, re.S))
+        legend = text.partition(LEGEND_HEADING)[2]
+        for mark, entry in (
+            ('─→', '`─→` returns'),
+            ('◆', 'densest logic'),
+            ('↑', 'shown above'),
+            ('…', '`…` more'),
+        ):
+            assert (entry in legend) == (mark in trees), (mark, entry)
 
 
 def test_data_shapes_are_a_bullet_list_under_a_heading(build):

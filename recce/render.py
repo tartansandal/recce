@@ -14,12 +14,62 @@ document, so a reader meeting one of these for the first time is never guessing.
 from __future__ import annotations
 
 import os
+import re
 from typing import List, Optional
 
 from .model import Func, Project
 from .rank import Block, Node, Plan
 
-LEGEND = '★ start here · ◆ densest logic · ~ skim · `[brackets]` = external'
+LEGEND_HEADING = '## Legend'
+
+# Every mark the trees can carry, with what finds it and what it says. Listed
+# in the order a reader meets them: which row to read, then what a row is
+# telling you, then what has been abbreviated, then what points elsewhere.
+#
+# It is built from the marks actually on the page rather than printed whole.
+# The old one-line legend explained the three rarest — `★` appears 149 times
+# across the corpus, `◆` 59 and `~` 22 — and left out the three commonest: the
+# return arrow at 1076, `↑` at 381 and `…` at 228. Fixing that by listing all
+# nine would spend nine lines of a ninety-line map on marks it does not use, so
+# each entry has to earn its line by being on the page.
+_LEGEND = (
+    (re.compile('★'), '`★` start here — the row this block is read from'),
+    (
+        re.compile('◆'),
+        '`◆` densest logic — where the decisions sit, when that is not the way in',
+    ),
+    (re.compile(r'\s~(\s|$)', re.M), '`~` skim — little to learn here'),
+    (re.compile('─→'), '`─→` returns'),
+    (
+        re.compile(r'\(\.\.\.\)'),
+        '`(...)` — three or more parameters, elided; the map is about flow',
+    ),
+    (
+        re.compile('↑'),
+        '`↑` shown above — the same call, already expanded earlier in this block',
+    ),
+    (
+        re.compile('…'),
+        '`…` more — trivial helpers folded into one row, or rows cut to fit',
+    ),
+    (
+        re.compile(r'\[[^\]]+\]\s*$', re.M),
+        '`[name]` external — a call leaving the project, named by its package',
+    ),
+    (
+        re.compile(r'^[\s│├└─]*[A-Za-z_][\w.]*\.[A-Za-z_]\w*\(\)(  ↑)?\s*$', re.M),
+        "`mod.func()` — the call crosses a file; that file's own block expands it",
+    ),
+)
+
+
+def legend_for(trees: str) -> List[str]:
+    """The legend for one map: the marks on its pages and nothing else."""
+    entries = [line for pattern, line in _LEGEND if pattern.search(trees)]
+    if not entries:
+        return []
+    return [LEGEND_HEADING, ''] + ['- {}'.format(entry) for entry in entries]
+
 
 # Where the bracket annotations line up, and the hard stop past which a row is
 # left ragged rather than pushed off the side of a terminal.
@@ -92,6 +142,7 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
             )
         lines.append('')
 
+    trees: List[str] = []
     for index, block in enumerate(plan.blocks, start=1):
         if plan.strategy != 'single':
             heading = '## [{}] {}'.format(index, block.title)
@@ -99,8 +150,13 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
                 heading += ' — {}'.format(block.purpose)
             lines.append(heading)
             lines.append('')
+        rows = _render_block(block)
+        # Kept apart from `lines` so the legend is built from the trees alone.
+        # Read off the whole document it would find its own examples and list
+        # every mark every time.
+        trees.extend(rows)
         lines.append('```')
-        lines.extend(_render_block(block))
+        lines.extend(rows)
         lines.append('```')
         lines.append('')
 
@@ -134,7 +190,7 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
             )
         lines.append('')
 
-    lines.append(LEGEND)
+    lines.extend(legend_for('\n'.join(trees)))
     return '\n'.join(lines).rstrip() + '\n'
 
 

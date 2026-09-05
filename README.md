@@ -12,15 +12,23 @@ sent to a hosted model.
 # with_docstring.py — Parse and summarize webserver access logs
 
 main(argv)  ★
- ├─ parse_line(line)  ★
+ ├─ parse_line(line)  ◆
  │   └─ … _parse_bytes
- ├─ summarize(records)  ★
+ ├─ summarize(records)  ◆
  │   └─ Counter()                           [collections]
  ├─ format_summary(s)
  │   └─ … _human_bytes
  └─ … _parse_args, _read_input              [argparse, pathlib]
+```
 
-★ read first · ~ skim · [brackets] = external
+Every map ends with a legend, listing the marks that appear on that page and
+no others:
+
+```
+- `★` start here — the row this block is read from
+- `◆` densest logic — where the decisions sit, when that is not the way in
+- `…` more — trivial helpers folded into one row, or rows cut to fit
+- `[name]` external — a call leaving the project, named by its package
 ```
 
 ## Running it
