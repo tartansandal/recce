@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Characterise codebases on the axes that predict how recce will behave.
+
+This exists so the corpus target list is a measurement rather than a taste.
+The regression tier grew out of specific bugs and is circular on purpose, but a
+held-out tier chosen the same way would inherit the same blind spots, and the
+one thing a held-out set has to be is *different*.
+
+The axes are the ones recce's own behaviour turns on, not general code metrics:
+
+- `mod` / `fn` — scale. Where the line budget stops binding is a property of
+  the tree, so a corpus needs targets on both sides of the knee.
+- `meth%` — how much of the code is methods. Class-heavy trees are what
+  `_constructor_factor` and the `_module_roots` promotion exist for; a
+  free-function codebase exercises neither.
+- `mdoc%` — modules carrying a docstring or header comment. The purpose line
+  reads from three sources and emits nothing when all are silent, so a corpus
+  of well-documented libraries never tests the silent path at all.
+- `unres%` — call sites resolution gives up on. This is the drop-don't-guess
+  rule under load: dispatch tables and callbacks push it up, and a corpus where
+  it is uniformly low never exercises the rule that matters most.
+- `deco%` — decorated functions, which is what `_entry_points` keys on for
+  framework code that nothing in the project calls.
+- `brmed` / `locmed` — median branches and length, the raw material of `_score`.
+
+Run it over candidates and the existing tier together; the useful output is not
+any single row but which regions of the space the current tier leaves empty.
+"""
+
+from __future__ import annotations
+
+import os
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from recce.extract import discover  # noqa: E402
+from recce.graph import resolve  # noqa: E402
+from recce.model import UNRESOLVED  # noqa: E402
+
+
+def pct(part: int, whole: int) -> float:
+    return 100.0 * part / whole if whole else 0.0
+
+
+def probe(path: str) -> dict:
+    project = discover(Path(path))
+    resolve(project)
+    funcs = project.funcs()
+    modules = [m for m in project.modules.values() if m.funcs]
+    calls = [c for f in funcs for c in f.calls]
+    return {
+        'mod': len(modules),
+        'fn': len(funcs),
+        'meth%': pct(sum(1 for f in funcs if f.is_method), len(funcs)),
+        'mdoc%': pct(
+            sum(1 for m in modules if m.doc or m.header_comment), len(modules)
+        ),
+        'unres%': pct(sum(1 for c in calls if c.kind == UNRESOLVED), len(calls)),
+        'deco%': pct(sum(1 for f in funcs if f.decorators), len(funcs)),
+        'brmed': statistics.median([f.n_branches for f in funcs]) if funcs else 0,
+        'locmed': statistics.median([f.loc for f in funcs]) if funcs else 0,
+    }
+
+
+COLUMNS = ('mod', 'fn', 'meth%', 'mdoc%', 'unres%', 'deco%', 'brmed', 'locmed')
+
+
+def main(argv):
+    if not argv:
+        print('usage: corpus-probe <name=path> ...', file=sys.stderr)
+        return 2
+    print('{:<12}'.format('target') + ''.join('{:>8}'.format(c) for c in COLUMNS))
+    for arg in argv:
+        name, _, path = arg.partition('=')
+        if not path:
+            name, path = os.path.basename(arg.rstrip('/')), arg
+        try:
+            row = probe(path)
+        except Exception as exc:  # a candidate that will not parse is a datum
+            print('{:<12}  ERROR {}'.format(name, exc))
+            continue
+        cells = ''.join(
+            '{:>8.0f}'.format(row[c]) if isinstance(row[c], float)
+            else '{:>8}'.format(row[c])
+            for c in COLUMNS
+        )
+        print('{:<12}'.format(name) + cells)
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
