@@ -85,8 +85,12 @@ def test_logging_is_filtered_out_as_plumbing(build):
     assert '[logging]' not in text
 
 
-def test_assembly_modules_are_filtered_out_as_plumbing(build):
-    """Calls that say what a function is built from, not what it does."""
+def test_the_measured_noise_modules_lose_their_bracket(build):
+    """The list in `graph.py`, asserted rather than re-argued.
+
+    Membership was decided by measuring what the freed rows bought, not by a
+    rule about what these calls are; the constants carry that evidence.
+    """
     project, _, _, text = build(
         {
             'a.py': (
@@ -104,17 +108,20 @@ def test_assembly_modules_are_filtered_out_as_plumbing(build):
     )
     assert '[itertools]' not in text
     assert '[functools]' not in text
-    # `collections` is deliberately not plumbing: a `Counter` says the function
-    # counts things, where `chain` says only that something was iterated.
+    # `collections` was in that list until it was measured. Dropping it removes
+    # 44 rows across the corpus and buys back repeat markers and duplicate
+    # constructors, so it keeps its bracket. It is asserted here because it is
+    # the case most likely to be added back on the strength of how similar it
+    # looks to the two above.
     assert '[collections]' in text
 
 
-def test_path_arithmetic_is_plumbing_but_filesystem_access_is_not(build):
-    """The one module that mixes the two kinds, split by what the call does.
+def test_path_arithmetic_loses_its_bracket_but_filesystem_access_keeps_one(build):
+    """`os` is judged one call at a time, because as a module it splits.
 
-    `os.path.join` computes a string from strings and tells a reader nothing.
-    `os.stat` touches the filesystem, which is exactly the sort of thing a
-    reader orienting in unfamiliar code has to know.
+    Dropping `os.path.join` and its neighbours paid for itself in the corpus.
+    Dropping `os.stat` would cost a reader the fact that this code goes to the
+    filesystem, which is the sort of thing they are reading the map to find.
     """
     project, _, _, text = build(
         {

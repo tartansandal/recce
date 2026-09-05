@@ -41,32 +41,47 @@ def is_stdlib(label: str) -> bool:
     return label.split('.')[0] in _STDLIB
 
 
-# Names that are almost always plumbing rather than a destination. They pass
-# the import test and would otherwise fill the map with rows nobody navigates
-# to. Logging is the worst offender: it appears in every function and tells the
-# reader nothing about the shape of the code.
+# Externals that do not earn their row. `_STDLIB` above ranks and never hides,
+# because being standard library is not grounds for hiding anything; the grounds
+# here are different, and it is worth being exact about what they are, because
+# the obvious answer is wrong.
 #
-# Note what this is and is not. `_STDLIB` above ranks and never hides, because
-# being standard library is not grounds for hiding anything — `pathlib` and
-# `pydub` are both surface. The grounds here are different: these calls are pure
-# operations on values the caller already has, so the row says what the code is
-# built out of rather than what it does. That criterion, not stdlib membership,
-# is what admits a name to this list.
+# This is a judgement list, not a derived rule. Three rules were tried against
+# the corpus and all three failed:
 #
-# The second group was measured rather than guessed. Over the corpus these
-# accounted for 73 rendered rows, and reading them back not one said anything
-# about the behaviour of the code containing it: `partial`, `chain`,
-# `itemgetter` and `zip_longest` describe the plumbing a function is assembled
-# from. `gettext` is the same case as logging — `_()` wraps every user-facing
-# string in argparse and marks nothing.
+# - *Pure operations on values the caller already holds.* Clean and mechanical,
+#   and it drops `Counter()` and `Path()`, which both have to stay. It also
+#   erases black and blib2to3 wholesale, since pure tree transformation is
+#   exactly what black is.
+# - *Repetition.* Capping each external at one row per block removes 16% of
+#   them and takes `console.Console` in httpx and black's own `is_lpar_token`
+#   first — the rows most worth keeping.
+# - *Ubiquity*, the information-theoretic version: a call spread across many
+#   modules says less than one concentrated in a few. Measured over five
+#   codebases the kept and dropped sets are indistinguishable (mean spread
+#   1.87% against 2.12%), and the most widespread calls of all are
+#   `pytest.raises` and `blib2to3.Leaf`.
 #
-# `collections` was in this list and came out, which is the useful part of the
-# record. It looks identical from here — `defaultdict(int)` is a container
-# choice the way `partial` is a call choice — but the skill checklist asserts
-# `Counter()` brackets in the log-summariser fixture, and it is right to. A
-# `Counter` says the function counts things, which is a fact about the data the
-# code builds rather than about how it was assembled. `chain` says only that
-# something was iterated.
+# So there is no property of a call that decides this. What decides it is the
+# trade, which the corpus can measure: remove a candidate, regenerate, and read
+# what takes the freed space. Dropping the names below removed 96 rendered rows
+# and bought, among others, the whole of rich's traceback rendering —
+# `__rich_console__` through `_render_stack` to pygments and linecache — which
+# had never fitted before. That is the admission test, and it is empirical.
+#
+# It has teeth, which is the point. `collections` looks exactly like the entries
+# below and was in this list until it was measured: dropping it removes 44
+# `Counter`, `defaultdict` and `ChainMap` rows and buys back repeat markers and
+# duplicate constructor rows. Bad trade, so it stays out — and note this agrees
+# with the skill checklist, which asserts `Counter()` brackets, but agreeing was
+# not the reason. The checklist runs three-function fixtures where nothing ever
+# competes for space, so it cannot settle a question about what to cut when the
+# budget binds.
+#
+# The asymmetry that governs the rest of recce governs additions here too. A row
+# wrongly dropped costs the reader something they cannot see is missing; a row
+# wrongly kept costs a line. Keep the list short, demand evidence per entry, and
+# when the trade is close, keep the bracket.
 _NOISE_LABELS = frozenset(
     {
         'logging',
@@ -80,25 +95,24 @@ _NOISE_LABELS = frozenset(
     }
 )
 
-# Path-name manipulation: computing a path from a path. `os` cannot go in the
-# list above because it is the one module that genuinely mixes the two kinds —
-# it was the largest single label in the corpus at 76 rendered rows, and half of
-# them were these. The other half are `os.stat`, `os.remove`, `os.write`,
-# `path.exists`, `environ.get`, and those stay, because a reader orienting in
-# unfamiliar code does need to know it touches the filesystem and reads the
-# environment. Only the arithmetic goes.
+# The same test applied one call at a time, because `os` cannot be judged as a
+# module. It was the largest single label in the corpus at 76 rendered rows, and
+# it splits down the middle: `join`, `basename`, `dirname` and `splitext` on one
+# side, `os.stat`, `os.remove`, `os.write`, `path.exists` and `environ.get` on
+# the other. Dropping the first half paid; the second half is a reader learning
+# that this code goes to the filesystem and reads the environment, which no
+# amount of freed space is worth.
 #
 # Keyed on the full dotted name so every import spelling resolves to the same
 # entry: `os.path.join(...)`, `from os import path` then `path.join(...)`, and
 # `from os.path import join` then `join(...)` are one call, written three ways.
 #
-# `pathlib` looks like the same case and is not, which is worth recording
-# because it was tried. Constructing a `Path` reads as plumbing, but `Path` is
-# routinely the head of a chain that does the work — `Path(p).read_text()` is
-# one call site recce can name and one it cannot, so dropping the construction
-# drops the only evidence the function touches a disk. `os.path.join` is never
-# the head of anything. The measured prize was seven rows in the whole corpus
-# against losing that, so pathlib keeps its bracket.
+# `pathlib` was tried here and failed the trade badly enough to record. The
+# prize was seven rows in the whole corpus, and the cost is that `Path` is
+# routinely the head of a chain doing the work — in `Path(p).read_text()` the
+# construction is a call site recce can name and the read is one it cannot, so
+# dropping the row drops the only evidence the function touches a disk.
+# `os.path.join` is never the head of anything.
 _PLUMBING_CALLS = frozenset(
     {
         'os.path.join',
@@ -119,7 +133,11 @@ _PLUMBING_CALLS = frozenset(
 
 
 def _is_plumbing(call: Call, label: str, bound: str) -> bool:
-    """Whether this external call is assembly rather than behaviour."""
+    """Whether this external call is one the map is better off without.
+
+    Membership is measured rather than reasoned about; the constants above
+    carry the evidence and the test for adding to them.
+    """
     if label in _NOISE_LABELS:
         return True
     # `bound` is where the root name came from and `call.dotted` is how this

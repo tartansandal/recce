@@ -114,14 +114,20 @@ are all unreadable; run the same code on 3.14 and they are fine. **Run recce on
 the newest Python you have**, whatever it was built against. When files do fail
 to parse the map says so at the top rather than quietly leaving them out.
 
-Some external calls are left out on purpose rather than missed. A bracket is
-meant to say what the code reaches for, so calls that only say what it is
-assembled from do not earn one: `itertools`, `functools`, `operator`, `gettext`,
-`logging`, `typing`, and the path arithmetic in `os.path` — `join`, `basename`,
-`dirname`, `splitext` and their neighbours. What stays is everything that
-touches something: `os.stat`, `os.remove`, `os.environ`, `pathlib`, and every
-third-party package. `os.path.join` tells you a string was built; `os.stat`
-tells you this code goes to the filesystem, and only one of those is worth a row.
+A short list of external calls is left out on purpose rather than missed:
+`itertools`, `functools`, `operator`, `gettext`, `logging`, `typing`, and the
+path arithmetic in `os.path` — `join`, `basename`, `dirname`, `splitext` and
+their neighbours. Everything else keeps its bracket, including the rest of
+`os`: `os.stat`, `os.remove`, `environ.get`, and `pathlib` in full.
+
+The list is short because it was measured rather than reasoned out. Each entry
+is there because removing it made room for something worth more — dropping these
+freed 96 rows across a corpus of fifteen codebases, and what moved in included
+the whole of `rich`'s traceback rendering. `collections` looks like it belongs
+and does not: dropping it costs 44 `Counter` and `defaultdict` rows and buys
+back little. Where a call is borderline it keeps its bracket, on the same
+grounds as everything else here — a row you never see is a cost you cannot
+notice, and a row you did not need is one line.
 
 The purpose line has a rule of its own. It comes from the module docstring, a
 README in that exact directory, or a top-of-file comment block — and from
