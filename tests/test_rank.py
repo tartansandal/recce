@@ -218,12 +218,8 @@ def _many_modules(count, prefix):
     return files
 
 
-def test_source_modules_outrank_tests_for_block_slots(build):
-    """weep has three scripts and three test files, and spent half its map on tests.
-
-    Sources take the slots first. Tests fill whatever is left over rather than
-    being excluded, since an empty slot helps nobody.
-    """
+def test_source_modules_take_the_block_slots(build):
+    """A map of the source is a map of the source, tests excluded."""
     files = {}
     files.update(_many_modules(10, 'src'))
     files.update({'tests/' + k: v for k, v in _many_modules(10, 'test_t').items()})
@@ -232,14 +228,49 @@ def test_source_modules_outrank_tests_for_block_slots(build):
     assert all(not t.startswith('test_') for t in titles), titles
 
 
-def test_tests_still_fill_slots_the_source_does_not_need(build):
+def test_a_small_project_excludes_its_tests_too(build):
+    """weep's actual shape: three scripts and three test files.
+
+    This is the failure `_select_modules` was written for, and for a long time
+    it was not covered at the size it happens at. The case above uses twenty
+    modules, which is over the block cap and so reaches the ranking; weep's six
+    are under it, and the early return handed back all six with half the map
+    spent on tests — the exact thing the fix was for, still happening.
+    """
+    files = {}
+    files.update(_many_modules(3, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(3, 'test_t').items()})
+    _, _, mapping, _ = build(files, '.')
+    titles = [b.title for b in mapping.blocks]
+    assert [t for t in titles if t.startswith('src')], titles
+    assert not [t for t in titles if t.startswith('test_')], titles
+
+
+def test_tests_do_not_take_a_slot_the_source_leaves_spare(build):
+    """Two source modules and ten test files map to two blocks, not eight.
+
+    An empty slot is the right outcome rather than a wasted one. Understanding
+    a package and understanding its suite are separate jobs, and a map that
+    answers neither is worse than a short map that answers one.
+    """
     files = {}
     files.update(_many_modules(2, 'src'))
     files.update({'tests/' + k: v for k, v in _many_modules(10, 'test_t').items()})
     _, _, mapping, _ = build(files, '.')
     titles = [b.title for b in mapping.blocks]
-    assert any(t.startswith('src') for t in titles)
-    assert any(t.startswith('test_t') for t in titles)
+    assert all(t.startswith('src') for t in titles), titles
+
+
+def test_tests_left_out_are_counted_apart_from_what_did_not_fit(build):
+    """Two absences with two different answers, so two different numbers."""
+    files = {}
+    files.update(_many_modules(3, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(4, 'test_t').items()})
+    _, _, mapping, text = build(files, '.')
+    assert mapping.omitted_modules == 0
+    assert mapping.omitted_tests == 4
+    assert 'further modules not shown' not in text
+    assert '4 test modules are not mapped here' in text
 
 
 def test_a_test_directory_on_its_own_still_maps(build):

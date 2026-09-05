@@ -136,6 +136,9 @@ class Plan:
     spine: List[Func] = field(default_factory=list)
     entries: List[Func] = field(default_factory=list)
     omitted_modules: int = 0
+    # Test modules left out because this is a map of the source. Counted apart
+    # from `omitted_modules`, which is source that did not fit.
+    omitted_tests: int = 0
 
 
 def annotate(project: Project, graph: Graph) -> List[Func]:
@@ -676,8 +679,7 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     if _wants_module_split(project):
         result.strategy = 'module'
         result.blocks = _module_blocks(project, graph, max_lines)
-        with_funcs = sum(1 for m in project.modules.values() if m.funcs)
-        result.omitted_modules = max(with_funcs - len(result.blocks), 0)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result)
         return result
 
     nodes = _fit(roots, project, graph, max_lines)
@@ -698,9 +700,26 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
         else _entry_blocks(project, graph, roots, max_lines)
     )
     if result.strategy == 'module':
-        with_funcs = sum(1 for m in project.modules.values() if m.funcs)
-        result.omitted_modules = max(with_funcs - len(result.blocks), 0)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result)
     return result
+
+
+def _omissions(project: Project, result: Plan) -> Tuple[int, int]:
+    """What is missing from the map, split by why it is missing.
+
+    Two reasons a module has no block, and the reader needs them apart. One is
+    that it did not fit, and the answer is a tighter target or a bigger budget.
+    The other is that it is a test module and this is a map of the source, where
+    the answer is to point recce at the tests instead. Reporting them as one
+    number sends a reader looking for source that was never missing.
+    """
+    with_funcs = [m for m in project.modules.values() if m.funcs]
+    tests = sum(1 for m in with_funcs if _is_test_module(m))
+    source = len(with_funcs) - tests
+    if not source:
+        # A map of a test suite: the tests are the subject, not an omission.
+        return max(len(with_funcs) - len(result.blocks), 0), 0
+    return max(source - len(result.blocks), 0), tests
 
 
 # Below this, a package reads better as one tree: the flow across two files is
@@ -818,26 +837,32 @@ def _is_test_module(module) -> bool:
 def _select_modules(project: Project, max_blocks: int) -> List[str]:
     """Which modules get a block, in the order they should be read.
 
-    Tests are ranked below source when the slots run out. They are kept in the
-    walk on purpose — a test suite is often the clearest statement of what code
-    is for — but a project with three modules and three test modules should not
-    spend half its map on the tests. Pointed at a test directory, where tests
-    are all there is, nothing is deprioritised and they fill the map as they
-    should.
+    Mapping a package to understand the package and mapping a test suite to
+    understand the suite are two jobs, and one document cannot do both — a map
+    that is mostly source with two test blocks bolted on serves neither reader.
+    So the tree decides which job this is: where there is source, the map is of
+    the source and test modules are not eligible for a block at all; where there
+    is nothing but tests, the tests are the subject and fill the map as they
+    should. The selector is the path recce was pointed at, which is why
+    `pkg/` and `pkg/tests/` give two different and equally correct maps.
+
+    This used to be a ranking rather than an exclusion, and ranking cannot
+    express it. Tests sorted last still take any slot the source does not fill,
+    so a repository with seven source modules and eight slots spent its eighth
+    on a test file; and the sort only ran when the modules outnumbered the
+    slots, so a project with three of each — the case this docstring has always
+    used as the thing that must not happen — returned all six untouched.
     """
     order = [n for n in _module_order(project) if project.modules[n].funcs]
-    if len(order) <= max_blocks:
-        return order
-    has_source = any(not _is_test_module(project.modules[n]) for n in order)
+    source = [n for n in order if not _is_test_module(project.modules[n])]
+    eligible = source or order
+    if len(eligible) <= max_blocks:
+        return eligible
     ranked = sorted(
-        order,
-        key=lambda n: (
-            has_source and _is_test_module(project.modules[n]),
-            -max(f.score for f in project.modules[n].funcs),
-        ),
+        eligible, key=lambda n: -max(f.score for f in project.modules[n].funcs)
     )
     keep = set(ranked[:max_blocks])
-    return [n for n in order if n in keep]
+    return [n for n in eligible if n in keep]
 
 
 def _module_roots(module, graph: Graph) -> List[Func]:

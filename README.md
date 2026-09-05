@@ -162,8 +162,10 @@ whether you can point this at something on a whim:
 
 Cost is nearly all parsing, so it scales with source read rather than with
 anything recce decides. Pointing it at a tree that large is a misuse — you get
-eight blocks and a note saying 1860 modules were not shown — but it will not
-fall over, and it says what it left out.
+eight blocks and a note accounting for the many hundreds of modules that are
+not shown — but it will not fall over, and it says what it left out. That note
+separates the two reasons a module is missing: source that did not fit, and
+test modules, which are not mapped alongside source at all.
 
 ## Notes, from a local model
 

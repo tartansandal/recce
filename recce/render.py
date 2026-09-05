@@ -76,6 +76,20 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
         if plan.omitted_modules:
             note += ', {} further modules not shown'.format(plan.omitted_modules)
         lines.append(note + '.')
+        if plan.omitted_tests:
+            # Said separately from the count above, because it is a different
+            # fact with a different answer. Source that did not fit wants a
+            # bigger budget; tests are absent because this is a map of the
+            # source, and the reader who wants them has to ask for a different
+            # map rather than a longer one.
+            lines.append('')
+            lines.append(
+                '{} test {} not mapped here; point recce at them for a map '
+                'of the suite.'.format(
+                    plan.omitted_tests,
+                    'module is' if plan.omitted_tests == 1 else 'modules are',
+                )
+            )
         lines.append('')
 
     for index, block in enumerate(plan.blocks, start=1):
