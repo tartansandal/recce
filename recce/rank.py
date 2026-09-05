@@ -673,10 +673,27 @@ def _note_for(func: Func, mode: str) -> Optional[str]:
 
 def _marker_for(func: Func) -> str:
     if func.role == SPINE:
-        return '★'
+        return '◆'
     if func.role == SKIM:
         return '~'
     return ''
+
+
+def _mark_lead(roots: List[Node]) -> List[Node]:
+    """Star the first row of a block: the row to start reading at.
+
+    Two markers because the block's way in and its densest function are not
+    reliably the same row, and one marker cannot say both. Where they are the
+    same — 41 of the 49 starred blocks in the corpus — this overwrites the
+    diamond and the block looks exactly as it always did. Where they differ it
+    is the case worth telling apart: `rank.py` leads with `plan` and its weight
+    is in `_build_tree` four levels down, and a single star had to choose
+    between sending the reader to a row they cannot read first and saying
+    nothing about where the work is.
+    """
+    if roots and roots[0].func is not None:
+        roots[0].marker = '★'
+    return roots
 
 
 def _fit(
@@ -761,7 +778,7 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
         # rule. Filling them in here meant picking an arbitrary module out of
         # a dict and calling its docstring the whole map's purpose, which was
         # invisible only because nothing read it back.
-        result.blocks = [Block(title='', purpose=None, roots=nodes)]
+        result.blocks = [Block(title='', purpose=None, roots=_mark_lead(nodes))]
         return result
 
     result.strategy = 'module' if len(project.modules) > 1 else 'entry'
@@ -874,7 +891,7 @@ def _module_blocks(
             Block(
                 title=titles[module.path],
                 purpose=module.doc or module.header_comment,
-                roots=nodes,
+                roots=_mark_lead(nodes),
             )
         )
     return blocks
@@ -1046,7 +1063,7 @@ def _entry_blocks(
             Block(
                 title='{}() flow'.format(root.qualname),
                 purpose=root.doc,
-                roots=[node],
+                roots=_mark_lead([node]),
             )
         )
     return blocks

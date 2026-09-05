@@ -19,7 +19,7 @@ from typing import List, Optional
 from .model import Func, Project
 from .rank import Block, Node, Plan
 
-LEGEND = '★ read first · ~ skim · `[brackets]` = external'
+LEGEND = '★ start here · ◆ densest logic · ~ skim · `[brackets]` = external'
 
 # Where the bracket annotations line up, and the hard stop past which a row is
 # left ragged rather than pushed off the side of a terminal.
@@ -111,10 +111,22 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
         lines.extend(data)
         lines.append('')
 
-    if plan.strategy != 'single' and plan.spine:
+    # The starred rows, in block order. This section and the `★` in the fences
+    # have to name the same functions or the document argues with itself, and
+    # naming where to start is what the heading has always promised. The
+    # score-ranked list lives on as `◆` inside the trees, where it answers the
+    # other question — which function carries the weight — without claiming to
+    # be the way in.
+    #
+    # Ordered by call depth rather than by block, because the blocks are already
+    # in dependency order and a list repeating it is a second table of contents.
+    # Depth puts the ways in first, which is the ordering the heading promises.
+    leads = [b.roots[0].func for b in plan.blocks if b.roots and b.roots[0].func]
+    leads.sort(key=lambda f: (f.depth if f.depth is not None else 99, f.module))
+    if plan.strategy != 'single' and leads:
         lines.append('## Spine to read first')
         lines.append('')
-        for position, func in enumerate(plan.spine[:5], start=1):
+        for position, func in enumerate(leads[:5], start=1):
             lines.append(
                 '{}. `{}:{} :: {}`'.format(
                     position, _relative(func.path, base), func.lineno, func.qualname
