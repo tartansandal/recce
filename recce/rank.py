@@ -598,6 +598,7 @@ def _build_tree(
     graph: Graph,
     depth_cap: int = 6,
     emitted: Optional[Set[str]] = None,
+    referenced: Optional[Set[str]] = None,
     members: Optional[Set[str]] = None,
     drop_skim: bool = False,
     external_depth: int = 99,
@@ -607,6 +608,8 @@ def _build_tree(
     by_id = project.by_id()
     if emitted is None:
         emitted = set()
+    if referenced is None:
+        referenced = set()
 
     def expand(func: Func, depth: int, path: Set[str]) -> Node:
         node = Node(
@@ -632,11 +635,28 @@ def _build_tree(
                     # the point of splitting by module rather than by accident.
                     # It becomes a reference leaf — named the way the calling
                     # file writes it — and the callee's own block expands it.
+                    #
+                    # Marked `↑` on every appearance after the first, the way a
+                    # repeated call inside the block is. Without it the same
+                    # name arrives looking like news each time: four of
+                    # requests' rows in one block are `_types.is_prepared()`,
+                    # and nothing distinguished them from four different calls.
+                    #
+                    # This runs before the trivial check, and the asymmetry is
+                    # deliberate. Collapsing a one-line helper into `…` is right
+                    # inside a module, where the row would say nothing; a row
+                    # naming another file says which file, which is the one
+                    # thing a per-module block cannot otherwise tell you.
+                    # Folding those in too was tried and saves four rows across
+                    # the whole corpus, which does not pay for an edge out of
+                    # the block going unnamed.
                     reference = '{}.{}()'.format(
                         callee.module.rsplit('.', 1)[-1], callee.qualname
                     )
                     if not any(c.label == reference for c in node.children):
-                        node.children.append(Node(label=reference))
+                        seen_before = callee.node_id in referenced
+                        referenced.add(callee.node_id)
+                        node.children.append(Node(label=reference, repeat=seen_before))
                     continue
                 if any(c.func is callee for c in node.children):
                     continue
@@ -767,8 +787,17 @@ def _fit(
     attempt: List[Node] = []
     for rung in _rungs():
         emitted: Set[str] = set()
+        referenced: Set[str] = set()
         attempt = [
-            _build_tree(root, project, graph, emitted=emitted, members=members, **rung)
+            _build_tree(
+                root,
+                project,
+                graph,
+                emitted=emitted,
+                referenced=referenced,
+                members=members,
+                **rung,
+            )
             for root in roots
         ]
         if sum(n.line_count() for n in attempt) <= max_lines:

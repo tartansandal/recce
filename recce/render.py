@@ -208,7 +208,9 @@ def _walk(
 def _row_text(node: Node) -> str:
     """The text of one row, before any bracket alignment."""
     if node.func is None:
-        return node.label
+        # A reference leaf carries its own repeat marker: it has no `func` to
+        # hang the usual one off, and it is the row most likely to arrive twice.
+        return node.label + ('  ↑' if node.repeat else '')
 
     text = '{}({})'.format(node.func.qualname, _args_of(node.func))
     if node.ret and not node.repeat:
