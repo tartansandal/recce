@@ -114,6 +114,15 @@ are all unreadable; run the same code on 3.14 and they are fine. **Run recce on
 the newest Python you have**, whatever it was built against. When files do fail
 to parse the map says so at the top rather than quietly leaving them out.
 
+Some external calls are left out on purpose rather than missed. A bracket is
+meant to say what the code reaches for, so calls that only say what it is
+assembled from do not earn one: `itertools`, `functools`, `operator`, `gettext`,
+`logging`, `typing`, and the path arithmetic in `os.path` — `join`, `basename`,
+`dirname`, `splitext` and their neighbours. What stays is everything that
+touches something: `os.stat`, `os.remove`, `os.environ`, `pathlib`, and every
+third-party package. `os.path.join` tells you a string was built; `os.stat`
+tells you this code goes to the filesystem, and only one of those is worth a row.
+
 The purpose line has a rule of its own. It comes from the module docstring, a
 README in that exact directory, or a top-of-file comment block — and from
 nothing else. Where all three are silent there is no purpose line, because a

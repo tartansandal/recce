@@ -85,6 +85,76 @@ def test_logging_is_filtered_out_as_plumbing(build):
     assert '[logging]' not in text
 
 
+def test_assembly_modules_are_filtered_out_as_plumbing(build):
+    """Calls that say what a function is built from, not what it does."""
+    project, _, _, text = build(
+        {
+            'a.py': (
+                'import itertools\n'
+                'from functools import partial\n'
+                'from collections import Counter\n'
+                '\n\n'
+                'def go(xs):\n'
+                '    counts = Counter(xs)\n'
+                '    f = partial(go, xs)\n'
+                '    return list(itertools.chain(xs, [f, counts]))\n'
+            )
+        },
+        'a.py',
+    )
+    assert '[itertools]' not in text
+    assert '[functools]' not in text
+    # `collections` is deliberately not plumbing: a `Counter` says the function
+    # counts things, where `chain` says only that something was iterated.
+    assert '[collections]' in text
+
+
+def test_path_arithmetic_is_plumbing_but_filesystem_access_is_not(build):
+    """The one module that mixes the two kinds, split by what the call does.
+
+    `os.path.join` computes a string from strings and tells a reader nothing.
+    `os.stat` touches the filesystem, which is exactly the sort of thing a
+    reader orienting in unfamiliar code has to know.
+    """
+    project, _, _, text = build(
+        {
+            'a.py': (
+                'import os\n\n\n'
+                'def go(d, name):\n'
+                '    p = os.path.join(d, os.path.basename(name))\n'
+                '    return os.stat(p)\n'
+            )
+        },
+        'a.py',
+    )
+    calls = calls_of(project, 'a', 'go')
+    assert calls['join'].kind == UNRESOLVED
+    assert calls['basename'].kind == UNRESOLVED
+    assert (calls['stat'].kind, calls['stat'].label) == (EXTERNAL, 'os')
+    assert 'path.join' not in text
+
+
+def test_path_arithmetic_is_recognised_however_it_was_imported(build):
+    """One call written three ways resolves to one entry in the table."""
+    project, _, _, _ = build(
+        {
+            'a.py': (
+                'import os\n'
+                'from os import path\n'
+                'from os.path import join\n'
+                '\n\n'
+                'def go(d):\n'
+                '    return os.path.join(d, path.join(d, join(d, "x")))\n'
+            )
+        },
+        'a.py',
+    )
+    func = next(f for f in project.modules['a'].funcs if f.qualname == 'go')
+    spellings = [c.dotted for c in func.calls if c.attr == 'join']
+    assert sorted(spellings) == ['join', 'os.path.join', 'path.join']
+    assert {c.kind for c in func.calls if c.attr == 'join'} == {UNRESOLVED}
+
+
 def test_the_stdlib_is_recognised_for_ranking(build):
     """Used to rank externals, never to hide them; both kinds still bracket."""
     from recce.graph import is_stdlib

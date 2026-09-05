@@ -45,7 +45,87 @@ def is_stdlib(label: str) -> bool:
 # the import test and would otherwise fill the map with rows nobody navigates
 # to. Logging is the worst offender: it appears in every function and tells the
 # reader nothing about the shape of the code.
-_NOISE_LABELS = frozenset({'logging', 'typing', 'warnings', '__future__'})
+#
+# Note what this is and is not. `_STDLIB` above ranks and never hides, because
+# being standard library is not grounds for hiding anything — `pathlib` and
+# `pydub` are both surface. The grounds here are different: these calls are pure
+# operations on values the caller already has, so the row says what the code is
+# built out of rather than what it does. That criterion, not stdlib membership,
+# is what admits a name to this list.
+#
+# The second group was measured rather than guessed. Over the corpus these
+# accounted for 73 rendered rows, and reading them back not one said anything
+# about the behaviour of the code containing it: `partial`, `chain`,
+# `itemgetter` and `zip_longest` describe the plumbing a function is assembled
+# from. `gettext` is the same case as logging — `_()` wraps every user-facing
+# string in argparse and marks nothing.
+#
+# `collections` was in this list and came out, which is the useful part of the
+# record. It looks identical from here — `defaultdict(int)` is a container
+# choice the way `partial` is a call choice — but the skill checklist asserts
+# `Counter()` brackets in the log-summariser fixture, and it is right to. A
+# `Counter` says the function counts things, which is a fact about the data the
+# code builds rather than about how it was assembled. `chain` says only that
+# something was iterated.
+_NOISE_LABELS = frozenset(
+    {
+        'logging',
+        'typing',
+        'warnings',
+        '__future__',
+        'itertools',
+        'functools',
+        'operator',
+        'gettext',
+    }
+)
+
+# Path-name manipulation: computing a path from a path. `os` cannot go in the
+# list above because it is the one module that genuinely mixes the two kinds —
+# it was the largest single label in the corpus at 76 rendered rows, and half of
+# them were these. The other half are `os.stat`, `os.remove`, `os.write`,
+# `path.exists`, `environ.get`, and those stay, because a reader orienting in
+# unfamiliar code does need to know it touches the filesystem and reads the
+# environment. Only the arithmetic goes.
+#
+# Keyed on the full dotted name so every import spelling resolves to the same
+# entry: `os.path.join(...)`, `from os import path` then `path.join(...)`, and
+# `from os.path import join` then `join(...)` are one call, written three ways.
+#
+# `pathlib` looks like the same case and is not, which is worth recording
+# because it was tried. Constructing a `Path` reads as plumbing, but `Path` is
+# routinely the head of a chain that does the work — `Path(p).read_text()` is
+# one call site recce can name and one it cannot, so dropping the construction
+# drops the only evidence the function touches a disk. `os.path.join` is never
+# the head of anything. The measured prize was seven rows in the whole corpus
+# against losing that, so pathlib keeps its bracket.
+_PLUMBING_CALLS = frozenset(
+    {
+        'os.path.join',
+        'os.path.basename',
+        'os.path.dirname',
+        'os.path.split',
+        'os.path.splitext',
+        'os.path.abspath',
+        'os.path.normpath',
+        'os.path.realpath',
+        'os.path.relpath',
+        'os.path.expanduser',
+        'os.path.expandvars',
+        'os.path.isabs',
+        'os.fspath',
+    }
+)
+
+
+def _is_plumbing(call: Call, label: str, bound: str) -> bool:
+    """Whether this external call is assembly rather than behaviour."""
+    if label in _NOISE_LABELS:
+        return True
+    # `bound` is where the root name came from and `call.dotted` is how this
+    # file wrote the chain, so replacing the root with its binding rebuilds the
+    # full name whichever way the import was spelled.
+    return bound + call.dotted[len(call.root or '') :] in _PLUMBING_CALLS
 
 
 @dataclass
@@ -215,7 +295,7 @@ def _classify(call: Call, resolver: _Resolver, module: str, cls: Optional[str]) 
             _resolve_project_import(call, resolver, owner, bound)
         else:
             label = bound.split('.')[0]
-            if label not in _NOISE_LABELS:
+            if not _is_plumbing(call, label, bound):
                 call.kind = EXTERNAL
                 call.label = label
         return
