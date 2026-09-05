@@ -14,7 +14,10 @@ filtering is the product, so the choices here are the ones to argue with:
 - **When to split.** The budget is a real constraint, not a suggestion, and a
   map that quietly runs to three screens has failed at its one job. So the tree
   is pruned down a fixed ladder, and when the bottom of that ladder still does
-  not fit, the map splits instead of shrinking further.
+  not fit, the map splits instead of shrinking further. Past that a tree is cut
+  to size and says how much went: the ladder only trades depth, and a wide tree
+  reaches the bottom of it still over budget, so without the cut the constraint
+  held everywhere except where it was binding.
 
 Nothing here reads a function body's meaning. `Func.note` stays empty; that is
 the slot a model fills in later.
@@ -768,6 +771,7 @@ def _fit(
     graph: Graph,
     max_lines: int,
     members: Optional[Set[str]] = None,
+    truncate: bool = True,
 ) -> List[Node]:
     """Expand roots into trees, pruning down a ladder until they fit.
 
@@ -780,9 +784,18 @@ def _fit(
     prefix of root trees that fits. Dropping a whole flow is dearer than
     anything on the ladder, so it is genuinely last.
 
-    Something always comes back. If even one root is over budget, that is what
-    ships, because a map that is four lines too long is a worse failure than
-    no map at all only in a spec.
+    Past that the last root is cut to fit rather than shipped over budget. It
+    used to ship, on the grounds that a map four lines too long beats no map,
+    and the overage turned out not to be four lines: every concession on the
+    ladder trades away depth, and the trees that reach the bottom of it are
+    wide, not deep. All fifteen blocks that came out over budget across the
+    corpus were at the tightest depth already, and yt-dlp's `_real_extract`
+    rendered 114 rows against a budget of 40. A budget missed by that much is
+    not a budget.
+
+    `truncate=False` is for a caller that needs the natural size rather than a
+    fitted one — `_spanning_block` sizes a flow by how many block slots it
+    would take, and a tree cut to one slot always looks like it takes one.
     """
     attempt: List[Node] = []
     for rung in _rungs():
@@ -809,7 +822,51 @@ def _fit(
     trimmed = _prefix_within(attempt, max_lines)
     if trimmed:
         return trimmed
-    return attempt[:1]
+    if not truncate:
+        return attempt[:1]
+    return [_truncate(attempt[0], max_lines)]
+
+
+def _truncate(node: Node, budget: int) -> Node:
+    """Cut a tree down to `budget` rows, saying how many went.
+
+    Whole child subtrees, from the end, rather than a clean slice through the
+    rows: a tree missing its last three branches is still a tree, where one cut
+    mid-branch leaves rows indented under a parent that is no longer there.
+
+    The count is exact and the row saying it is inside the budget, because a
+    reader who cannot see that something was dropped has been misled rather
+    than economised on — the same reason a module that did not fit is counted
+    in the note at the top of the map.
+    """
+    if node.line_count() <= budget:
+        return node
+    own = 1 + (1 if node.note else 0)
+    if own >= budget:
+        node.children = []
+        return node
+
+    # Something is going to be dropped, so the row that says so is reserved up
+    # front rather than clawed back afterwards.
+    room = budget - own - 1
+    kept: List[Node] = []
+    rest = list(node.children)
+    while rest and room > 0:
+        child = rest.pop(0)
+        if child.line_count() > room:
+            # Cut into it rather than stopping at it. Keeping only whole
+            # subtrees sounds tidier and spends the budget badly: yt-dlp's
+            # widest block has two one-line children and then a large one, so
+            # stopping gave three rows of a possible forty and a note saying 42
+            # things were dropped.
+            child = _truncate(child, room)
+        kept.append(child)
+        room -= child.line_count()
+
+    node.children = kept
+    if rest:
+        node.children.append(Node(label='… {} more'.format(len(rest))))
+    return node
 
 
 def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
@@ -1026,7 +1083,7 @@ def _spanning_block(
     # both of the ones worth having.
     nodes = None
     for slots in range(1, _SPANNING_MAX_SLOTS + 1):
-        attempt = _fit([root], project, graph, slots * max_lines)
+        attempt = _fit([root], project, graph, slots * max_lines, truncate=False)
         if attempt[0].line_count() <= slots * max_lines:
             nodes = attempt
             break

@@ -491,3 +491,55 @@ def test_type_test_does_not_report_the_source_it_was_told_to_drop(build):
     _, _, mapping, text = build(files, '.', kind='test')
     assert mapping.omitted_tests == 0
     assert 'not mapped here' not in text
+
+
+def test_a_tree_too_wide_to_prune_is_cut_rather_than_shipped_over(build):
+    """The ladder trades depth, and some trees are wide.
+
+    Every concession in `_CONCESSION_ORDER` shortens a tree: fewer notes,
+    shallower externals, a lower depth cap, no skims. None of them narrows one.
+    A function calling fifty others is fifty rows at any depth, so the ladder
+    runs out with the tree still over budget, and it used to ship anyway —
+    yt-dlp rendered 114 rows against a budget of 40.
+    """
+    calls = '\n'.join('    helper_{}(x)'.format(n) for n in range(50))
+    helpers = '\n\n'.join(
+        'def helper_{}(x):\n    total = 0\n    for i in range(x):\n'
+        '        if i:\n            total += i\n    return total'.format(n)
+        for n in range(50)
+    )
+    _, _, mapping, text = build(
+        {
+            'a.py': '"""Wide."""\n\n\ndef go(x):\n{}\n    return x\n\n\n{}\n'.format(
+                calls, helpers
+            )
+        },
+        'a.py',
+        max_lines=40,
+    )
+    for block in mapping.blocks:
+        assert block.line_count() <= 40, block.line_count()
+    assert 'more' in text
+
+
+def test_what_was_cut_is_counted_not_silently_dropped(build):
+    """A reader who cannot see that rows went has been misled, not spared."""
+    calls = '\n'.join('    helper_{}(x)'.format(n) for n in range(30))
+    helpers = '\n\n'.join(
+        'def helper_{}(x):\n    total = 0\n    for i in range(x):\n'
+        '        if i:\n            total += i\n    return total'.format(n)
+        for n in range(30)
+    )
+    _, _, _, text = build(
+        {
+            'a.py': '"""Wide."""\n\n\ndef go(x):\n{}\n    return x\n\n\n{}\n'.format(
+                calls, helpers
+            )
+        },
+        'a.py',
+        max_lines=20,
+    )
+    marker = [line for line in text.splitlines() if '…' in line and 'more' in line]
+    assert marker, text
+    # The count names rows that exist rather than rows that were rendered.
+    assert int(marker[0].split()[-2]) > 0
