@@ -122,6 +122,9 @@ class Block:
     title: str
     purpose: Optional[str]
     roots: List[Node] = field(default_factory=list)
+    # Drawn across module boundaries rather than being one module's block, so
+    # it is not a module the omission counts should account for.
+    spanning: bool = False
 
     def line_count(self) -> int:
         return sum(root.line_count() for root in self.roots)
@@ -155,6 +158,18 @@ def annotate(project: Project, graph: Graph) -> List[Func]:
 # code. Everything at or past it is ordered by reach instead of by tier.
 _INFERRED = 3
 
+# The one tier that is a statement rather than a reading: a `[project.scripts]`
+# target names an executable, in a manifest, on purpose. It is the only evidence
+# the spanning block will build on.
+_DECLARED = 0
+
+# The `__main__`-guard tier. Trusted for naming a way in and not for leading a
+# document, because in library code a guard usually marks a demo rather than
+# the program: rich carries 43 of them, one at the foot of each module it can
+# show off, and building the spanning block on those picked a private method of
+# the traceback renderer as how rich fits together.
+_GUARD = 1
+
 # How deep a flow is followed when measuring what an entry point leads to.
 # Matches the deepest rung of `_DEPTH_LADDER`, so reach measures the tree a
 # reader could actually be shown rather than one the budget would never render.
@@ -181,6 +196,42 @@ def _reach_sets(funcs: Sequence[Func], graph: Graph) -> Dict[str, Set[str]]:
                 frontier.append((callee, depth + 1))
         sets[func.node_id] = seen
     return sets
+
+
+def declared_ways_in(project: Project, graph: Graph) -> Dict[str, int]:
+    """Ways in the code states, keyed by node id, valued by which tier said so.
+
+    A `[project.scripts]` target, a `__main__` guard and a framework decorator
+    are facts: the code is telling you how it is run. Everything else recce
+    calls an entry point is read off the graph, where "nothing calls it" cannot
+    be told from "nothing calls it yet".
+
+    The distinction is worth its own function because the two are not
+    interchangeable. Ordering a list of candidates tolerates a wrong guess —
+    the reader sees a slightly odd second row. Leading the whole document with
+    one does not, so `_spanning_block` will only build on these.
+    """
+    tiers: Dict[str, int] = {}
+
+    def offer(func: Optional[Func], rank: int) -> None:
+        if func is not None and func.node_id not in tiers:
+            tiers[func.node_id] = rank
+
+    for declared in project.declared_entries:
+        offer(_resolve_declared(declared, project), 0)
+
+    by_id = project.by_id()
+    for module in project.modules.values():
+        for target in graph.entry_calls.get(module.name, []):
+            offer(by_id.get(target), 1)
+
+    for func in by_id.values():
+        tails = func.decorator_tails
+        if any(d in _NON_ENTRY_DECORATORS for d in tails):
+            continue
+        if any(d in _ENTRY_DECORATORS for d in tails):
+            offer(func, 2)
+    return tiers
 
 
 def _entry_points(project: Project, graph: Graph) -> List[Func]:
@@ -215,22 +266,17 @@ def _entry_points(project: Project, graph: Graph) -> List[Func]:
             seen.add(func.node_id)
             ranked.append((rank, func.node_id, func))
 
-    for declared in project.declared_entries:
-        offer(_resolve_declared(declared, project), 0)
+    # The tiers where the code says how it is run, rather than where recce
+    # reads it off the graph. Kept apart because more than one caller needs to
+    # know which of the two a way in came from.
+    for node_id, rank in declared_ways_in(project, graph).items():
+        offer(by_id.get(node_id), rank)
 
-    for module in project.modules.values():
-        for target in graph.entry_calls.get(module.name, []):
-            offer(by_id.get(target), 1)
-
-    # One pass, in rank order: `offer` keeps the first rank a function is
-    # given, so checking the declared ways in before the graph-shape fallback
-    # is what makes a decorated entry point outrank its own lack of callers.
     for func in by_id.values():
         tails = func.decorator_tails
         if any(d in _NON_ENTRY_DECORATORS for d in tails):
             continue
-        if any(d in _ENTRY_DECORATORS for d in tails):
-            offer(func, 2)
+        if func.node_id in seen:
             continue
         if func.name == 'main' and not func.is_method:
             offer(func, 3)
@@ -766,7 +812,7 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     roots = _roots_for(entries, project, graph)
     if _wants_module_split(project):
         result.strategy = 'module'
-        result.blocks = _module_blocks(project, graph, max_lines)
+        result.blocks = _blocks_with_spanning(project, graph, max_lines)
         result.omitted_modules, result.omitted_tests = _omissions(project, result)
         return result
 
@@ -783,13 +829,169 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
 
     result.strategy = 'module' if len(project.modules) > 1 else 'entry'
     result.blocks = (
-        _module_blocks(project, graph, max_lines)
+        _blocks_with_spanning(project, graph, max_lines)
         if result.strategy == 'module'
         else _entry_blocks(project, graph, roots, max_lines)
     )
     if result.strategy == 'module':
         result.omitted_modules, result.omitted_tests = _omissions(project, result)
     return result
+
+
+# Past eight blocks the document stops being a map and becomes a listing.
+_MAX_BLOCKS = 8
+
+# What a spanning block has to be worth to take one of those eight slots from a
+# module. Fewer modules than this and it is a module block wearing a different
+# heading; fewer rows and it is a heading with nothing under it. Three rather
+# than two because httpx's flow crossed exactly one boundary and led the map
+# with a tree that a module block would have shown nearly as well.
+_SPANNING_MIN_MODULES = 3
+_SPANNING_MIN_ROWS = 5
+
+# The most block slots one flow may buy. Past half the document the map has
+# stopped being a map of the package and become one flow with offcuts.
+_SPANNING_MAX_SLOTS = 4
+
+# How much fragmentation has to be on the page before a flow drawn across the
+# modules is worth the slot it takes from one. Set from the gap in the measured
+# distribution: the code-map fixture cuts 2 calls, networkx 3 and json 4, and
+# none of them is fragmented — networkx's blocks are independent algorithm
+# modules that barely call each other. The next value up is recce at 10, then
+# toolz 12, requests 40, black 60, yt-dlp 150, all of which are spending real
+# rows on calls they cannot follow.
+_SPANNING_MIN_STUBS = 10
+
+
+def _iter_nodes(node: Node):
+    yield node
+    for child in node.children:
+        yield from _iter_nodes(child)
+
+
+def _blocks_with_spanning(
+    project: Project, graph: Graph, max_lines: int
+) -> List[Block]:
+    """Module blocks, led by one flow drawn across them where there is one.
+
+    A map of per-module blocks answers what each file contains and never
+    answers how they fit together, because every call leaving a module is cut
+    to an unexpanded reference leaf — 17% of rendered rows on requests and 40%
+    on yt-dlp are those stubs. One block drawn with no `members` restriction
+    follows a flow wherever it goes, which is the view the rest of the document
+    cannot give.
+
+    It has to earn the slot it takes, so it is built first and kept only if it
+    spans real ground. Where a codebase has no flow crossing a module boundary
+    the block is not built and the map is exactly as it was.
+    """
+    modules = _module_blocks(project, graph, max_lines, _MAX_BLOCKS)
+    if _stub_rows(modules) < _SPANNING_MIN_STUBS:
+        # Nothing is being cut apart, so there is nothing to draw together. A
+        # small package whose blocks already show the whole flow gets the map it
+        # got before, rather than a fourth heading restating the other three.
+        return modules
+    spanning = _spanning_block(project, graph, max_lines)
+    if spanning is None:
+        return modules
+    slots = -(-spanning.line_count() // max_lines)
+    return [spanning] + _module_blocks(project, graph, max_lines, _MAX_BLOCKS - slots)
+
+
+def _stub_rows(blocks: Sequence[Block]) -> int:
+    """Rows that name a call leaving the block and cannot follow it.
+
+    This is the cost the spanning block exists to offset, so it is also what
+    decides whether that block is worth a slot. A reference leaf has no `func`
+    to expand and no bracket, and carries a dotted name written the way the
+    calling file writes it.
+    """
+    return sum(
+        1
+        for block in blocks
+        for root in block.roots
+        for node in _iter_nodes(root)
+        if node.func is None and not node.bracket and '.' in node.label
+    )
+
+
+def _spanning_block(project: Project, graph: Graph, max_lines: int) -> Optional[Block]:
+    """The one flow worth drawing across module boundaries, or nothing.
+
+    Built only on a way in the code declares — a console script, a `__main__`
+    guard, a framework decorator. Any inferred entry point will do to order a
+    list, and will not do to lead a document. Allowing them produced a block on
+    every large library, and on a library there is no dominant flow to find, so
+    what led the map was whichever deep function happened to touch the most
+    files: `Provider.ascii_company_email` for faker,
+    `_SubqueryLoader.create_row_processor` for sqlalchemy, one downloader of
+    hundreds for yt-dlp. Each was presented, by position, as how the package
+    fits together. That is the guessed purpose line again in another costume.
+
+    So where a project does not say how it is run, there is no spanning block
+    and the map is the module blocks alone. `--type app` is the way to say it
+    anyway when the entry point is one recce cannot see.
+
+    Only `_DECLARED`, and the two weaker tiers are excluded for reasons worth
+    keeping. A `__main__` guard marks a demo as readily as a program — see
+    `_GUARD`. A framework decorator is a name match and nothing more: rich's
+    `Traceback._render_stack` is decorated `@group`, which is in
+    `_ENTRY_DECORATORS` and means "combine these renderables" rather than
+    "something calls this", and it led rich's map until this was narrowed. Ways
+    in that live in a test module are excluded too, which `_select_modules`
+    already does for the module blocks and which this door bypassed.
+
+    Among what remains, the one reaching the most modules wins. That is also
+    what stops a wrapper leading: black declares both `main` and
+    `patched_main`, and the wrapper reaches six modules where the function it
+    wraps reaches ten.
+    """
+    tests = {m.name for m in project.modules.values() if _is_test_module(m)}
+    ways_in = declared_ways_in(project, graph)
+    by_id = project.by_id()
+    candidates = [
+        by_id[n]
+        for n, tier in ways_in.items()
+        if n in by_id and tier == _DECLARED and by_id[n].module not in tests
+    ]
+    if not candidates:
+        return None
+    reach = _reach_sets(candidates, graph)
+
+    def spans(func: Func) -> int:
+        return len({by_id[n].module for n in reach[func.node_id] if n in by_id})
+
+    root = max(candidates, key=lambda f: (spans(f), len(reach[f.node_id]), f.node_id))
+    if spans(root) < _SPANNING_MIN_MODULES:
+        return None
+    # Buy as many block slots as the flow needs, cheapest first. One slot is
+    # one module's worth of budget, so a three-slot block displaces three module
+    # blocks and the document stays bounded by `_MAX_BLOCKS * max_lines` exactly
+    # as before — the flow is paid for in modules, not in extra length.
+    #
+    # It has to be bought rather than pruned because the pruning ladder cannot
+    # reach these trees. Every concession on it trades away depth, and a
+    # whole-program flow is wide: recce's is 106 lines at the tightest rung
+    # available and cookiecutter's 62, unchanged by anything `_fit` can do. A
+    # flat one-slot budget kept only the two that happened to fit and dropped
+    # both of the ones worth having.
+    nodes = None
+    for slots in range(1, _SPANNING_MAX_SLOTS + 1):
+        attempt = _fit([root], project, graph, slots * max_lines)
+        if attempt[0].line_count() <= slots * max_lines:
+            nodes = attempt
+            break
+    if nodes is None:
+        return None
+    drawn = {n.func.module for n in _iter_nodes(nodes[0]) if n.func is not None}
+    if len(drawn) < _SPANNING_MIN_MODULES or nodes[0].line_count() < _SPANNING_MIN_ROWS:
+        return None
+    return Block(
+        title='{}() across {} modules'.format(root.qualname, len(drawn)),
+        purpose=root.doc,
+        roots=_mark_lead(nodes),
+        spanning=True,
+    )
 
 
 def _omissions(project: Project, result: Plan) -> Tuple[int, int]:
@@ -804,10 +1006,13 @@ def _omissions(project: Project, result: Plan) -> Tuple[int, int]:
     with_funcs = [m for m in project.modules.values() if m.funcs]
     tests = sum(1 for m in with_funcs if _is_test_module(m))
     source = len(with_funcs) - tests
+    # The spanning block is a flow, not a module, so it does not reduce the
+    # count of modules still unshown.
+    shown = sum(1 for b in result.blocks if not b.spanning)
     if not source:
         # A map of a test suite: the tests are the subject, not an omission.
-        return max(len(with_funcs) - len(result.blocks), 0), 0
-    return max(source - len(result.blocks), 0), tests
+        return max(len(with_funcs) - shown, 0), 0
+    return max(source - shown, 0), tests
 
 
 # Below this, a package reads better as one tree: the flow across two files is
@@ -860,7 +1065,7 @@ def _roots_for(entries: Sequence[Func], project: Project, graph: Graph) -> List[
 
 
 def _module_blocks(
-    project: Project, graph: Graph, max_lines: int, max_blocks: int = 8
+    project: Project, graph: Graph, max_lines: int, max_blocks: int = _MAX_BLOCKS
 ) -> List[Block]:
     """One block per module, leaves first, capped at what a reader will read.
 

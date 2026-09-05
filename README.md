@@ -87,6 +87,22 @@ existing one without `--force`. The command that refreshes a draft and the
 command that destroys it are otherwise the same keystrokes, and while the notes
 cache brings recce's own sentences back from disk, nothing brings yours back.
 
+A package of more than two modules is drawn as one block per file, which
+answers what each file holds and not how they fit together — every call leaving
+a module becomes a reference leaf the block cannot follow. So where a project
+declares how it is run, in `[project.scripts]`, the map opens with that flow
+drawn across the modules it touches:
+
+```
+## [1] main() across 6 modules
+```
+
+It is bought rather than added: a flow needing three blocks' worth of lines
+displaces three per-file blocks, and the modules that lose their place are
+counted in the note at the top. A project that does not declare an entry point
+gets no such block, because the alternative is picking whichever deep function
+happens to touch the most files and calling it the way in.
+
 It is not a call-graph dump. `pyan` and `code2flow` already draw every edge, and
 a complete graph of unfamiliar code is as hard to read as the code. recce
 filters: trivial helpers collapse into a `…` row, external calls are pushed to
