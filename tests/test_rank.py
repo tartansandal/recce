@@ -432,3 +432,62 @@ def test_a_shim_entry_point_does_not_lead_the_spine(build):
     spine = [f.node_id for f in mapping.spine]
     assert 'pkg.cli::main' not in spine, spine
     assert spine[0] == 'pkg.work::process'
+
+
+_APP_FILES = {
+    'pkg/__init__.py': '',
+    'pkg/one.py': '"""One."""\n\n\ndef step_one(xs):\n    total = 0\n    for x in xs:\n        if x:\n            total += x\n    return total\n',
+    'pkg/two.py': '"""Two."""\n\nfrom .one import step_one\n\n\ndef step_two(xs):\n    return step_one(xs) + 1\n',
+    'pkg/three.py': '"""Three."""\n\nfrom .two import step_two\n\n\ndef step_three(xs):\n    return step_two(xs) * 2\n',
+    'pkg/four.py': '"""Four."""\n\nfrom .three import step_three\n\n\ndef step_four(xs):\n    return step_three(xs) - 1\n',
+    'pkg/five.py': '"""Five."""\n\nfrom .four import step_four\n\n\ndef step_five(xs):\n    return step_four(xs) + 3\n',
+    'pkg/cli.py': '"""Entry."""\n\nfrom .five import step_five\n\n\ndef main(argv):\n    """Run it."""\n    return step_five(argv)\n',
+}
+
+
+def test_type_app_draws_a_flow_without_a_declared_script(build):
+    """The case the flag exists for.
+
+    httpie, flake8 and pre-commit declare no console script, so the evidence
+    gate leaves them with no way to ask for the flow that crosses their
+    modules. `--type app` is the reader supplying what the manifest does not.
+    """
+    _, _, plain, _ = build(_APP_FILES, 'pkg')
+    _, _, asked, _ = build(_APP_FILES, 'pkg', kind='app')
+    assert not any(b.spanning for b in plain.blocks)
+    assert [b.spanning for b in asked.blocks][0]
+    assert 'across' in asked.blocks[0].title
+
+
+def test_type_lib_suppresses_the_flow_block(build):
+    """Said of the same tree that `--type app` draws a flow across."""
+    _, _, as_app, _ = build(_APP_FILES, 'pkg', kind='app')
+    _, _, as_lib, _ = build(_APP_FILES, 'pkg', kind='lib')
+    assert any(b.spanning for b in as_app.blocks)
+    assert not any(b.spanning for b in as_lib.blocks)
+
+
+def test_type_test_makes_the_suite_the_subject(build):
+    """The mirror of the default, for a tree holding both.
+
+    A repository root has source and tests in it and the tree cannot say which
+    the reader came for. Left alone recce maps the source; asked, it maps the
+    suite, and in neither case does it mix them.
+    """
+    files = {}
+    files.update(_many_modules(4, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(4, 'test_t').items()})
+    _, _, default, _ = build(files, '.')
+    _, _, asked, _ = build(files, '.', kind='test')
+    assert all(b.title.startswith('src') for b in default.blocks), default.blocks
+    assert all(b.title.startswith('test_t') for b in asked.blocks), asked.blocks
+
+
+def test_type_test_does_not_report_the_source_it_was_told_to_drop(build):
+    """Source is absent because it was asked to be, so it is not an omission."""
+    files = {}
+    files.update(_many_modules(3, 'src'))
+    files.update({'tests/' + k: v for k, v in _many_modules(3, 'test_t').items()})
+    _, _, mapping, text = build(files, '.', kind='test')
+    assert mapping.omitted_tests == 0
+    assert 'not mapped here' not in text

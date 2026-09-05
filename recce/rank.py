@@ -796,7 +796,9 @@ def _prefix_within(nodes: Sequence[Node], max_lines: int) -> List[Node]:
     return kept
 
 
-def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
+def plan(
+    project: Project, graph: Graph, max_lines: int = 40, kind: Optional[str] = None
+) -> Plan:
     """Build the whole map structure, splitting if it will not fit.
 
     Whatever comes out of the bottom of `_fit`'s ladder still over budget gets
@@ -812,8 +814,8 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
     roots = _roots_for(entries, project, graph)
     if _wants_module_split(project):
         result.strategy = 'module'
-        result.blocks = _blocks_with_spanning(project, graph, max_lines)
-        result.omitted_modules, result.omitted_tests = _omissions(project, result)
+        result.blocks = _blocks_with_spanning(project, graph, max_lines, kind)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result, kind)
         return result
 
     nodes = _fit(roots, project, graph, max_lines)
@@ -829,12 +831,12 @@ def plan(project: Project, graph: Graph, max_lines: int = 40) -> Plan:
 
     result.strategy = 'module' if len(project.modules) > 1 else 'entry'
     result.blocks = (
-        _blocks_with_spanning(project, graph, max_lines)
+        _blocks_with_spanning(project, graph, max_lines, kind)
         if result.strategy == 'module'
         else _entry_blocks(project, graph, roots, max_lines)
     )
     if result.strategy == 'module':
-        result.omitted_modules, result.omitted_tests = _omissions(project, result)
+        result.omitted_modules, result.omitted_tests = _omissions(project, result, kind)
     return result
 
 
@@ -870,7 +872,7 @@ def _iter_nodes(node: Node):
 
 
 def _blocks_with_spanning(
-    project: Project, graph: Graph, max_lines: int
+    project: Project, graph: Graph, max_lines: int, kind: Optional[str] = None
 ) -> List[Block]:
     """Module blocks, led by one flow drawn across them where there is one.
 
@@ -885,13 +887,23 @@ def _blocks_with_spanning(
     spans real ground. Where a codebase has no flow crossing a module boundary
     the block is not built and the map is exactly as it was.
     """
-    modules = _module_blocks(project, graph, max_lines, _MAX_BLOCKS)
-    if _stub_rows(modules) < _SPANNING_MIN_STUBS:
+    modules = _module_blocks(project, graph, max_lines, _MAX_BLOCKS, kind)
+    if kind in ('lib', 'test'):
+        # `lib` says there is no one flow to lead with, `test` that the subject
+        # is a suite whose modules seldom share one. Either way the answer is
+        # the per-file blocks, and asking is cheaper than recce guessing.
+        return modules
+    if kind != 'app' and _stub_rows(modules) < _SPANNING_MIN_STUBS:
         # Nothing is being cut apart, so there is nothing to draw together. A
         # small package whose blocks already show the whole flow gets the map it
         # got before, rather than a fourth heading restating the other three.
+        #
+        # Skipped under `--type app`, because this is a guess about whether the
+        # block is worth having and the reader has just answered that question.
+        # The floors in `_spanning_block` still apply: they are about whether
+        # there is a flow at all, which no flag can assert into existence.
         return modules
-    spanning = _spanning_block(project, graph, max_lines)
+    spanning = _spanning_block(project, graph, max_lines, kind)
     if spanning is None:
         return modules
     slots = -(-spanning.line_count() // max_lines)
@@ -915,7 +927,9 @@ def _stub_rows(blocks: Sequence[Block]) -> int:
     )
 
 
-def _spanning_block(project: Project, graph: Graph, max_lines: int) -> Optional[Block]:
+def _spanning_block(
+    project: Project, graph: Graph, max_lines: int, kind: Optional[str] = None
+) -> Optional[Block]:
     """The one flow worth drawing across module boundaries, or nothing.
 
     Built only on a way in the code declares — a console script, a `__main__`
@@ -949,11 +963,17 @@ def _spanning_block(project: Project, graph: Graph, max_lines: int) -> Optional[
     tests = {m.name for m in project.modules.values() if _is_test_module(m)}
     ways_in = declared_ways_in(project, graph)
     by_id = project.by_id()
-    candidates = [
-        by_id[n]
-        for n, tier in ways_in.items()
-        if n in by_id and tier == _DECLARED and by_id[n].module not in tests
-    ]
+    if kind == 'app':
+        # The reader has asserted what the manifest does not say, which is the
+        # case this flag exists for: httpie, flake8 and pre-commit all declare
+        # no console script, so the strict gate leaves them with no way to ask.
+        # Every entry point is a candidate, and the reach ordering below picks
+        # among them — the risk of an arbitrary pick is the reader's to take,
+        # having said this is an application.
+        pool = {f.node_id for f in _entry_points(project, graph)}
+    else:
+        pool = {n for n, tier in ways_in.items() if tier == _DECLARED}
+    candidates = [by_id[n] for n in pool if n in by_id and by_id[n].module not in tests]
     if not candidates:
         return None
     reach = _reach_sets(candidates, graph)
@@ -994,7 +1014,9 @@ def _spanning_block(project: Project, graph: Graph, max_lines: int) -> Optional[
     )
 
 
-def _omissions(project: Project, result: Plan) -> Tuple[int, int]:
+def _omissions(
+    project: Project, result: Plan, kind: Optional[str] = None
+) -> Tuple[int, int]:
     """What is missing from the map, split by why it is missing.
 
     Two reasons a module has no block, and the reader needs them apart. One is
@@ -1009,8 +1031,14 @@ def _omissions(project: Project, result: Plan) -> Tuple[int, int]:
     # The spanning block is a flow, not a module, so it does not reduce the
     # count of modules still unshown.
     shown = sum(1 for b in result.blocks if not b.spanning)
+    if kind == 'test':
+        # The suite is the subject and the source was set aside on purpose, so
+        # what is missing is the test modules that did not fit. Source is not
+        # counted as absent: the reader asked for it to be.
+        return max(tests - shown, 0), 0
     if not source:
-        # A map of a test suite: the tests are the subject, not an omission.
+        # Nothing but tests in the tree, so they are the subject by default and
+        # are not an omission either.
         return max(len(with_funcs) - shown, 0), 0
     return max(source - shown, 0), tests
 
@@ -1065,7 +1093,11 @@ def _roots_for(entries: Sequence[Func], project: Project, graph: Graph) -> List[
 
 
 def _module_blocks(
-    project: Project, graph: Graph, max_lines: int, max_blocks: int = _MAX_BLOCKS
+    project: Project,
+    graph: Graph,
+    max_lines: int,
+    max_blocks: int = _MAX_BLOCKS,
+    kind: Optional[str] = None,
 ) -> List[Block]:
     """One block per module, leaves first, capped at what a reader will read.
 
@@ -1078,7 +1110,7 @@ def _module_blocks(
     knows they are seeing eight modules of thirty can go and ask for the rest.
     """
     blocks: List[Block] = []
-    chosen = _select_modules(project, max_blocks)
+    chosen = _select_modules(project, max_blocks, kind)
     titles = _block_titles([project.modules[n].path for n in chosen])
     for name in chosen:
         module = project.modules[name]
@@ -1156,7 +1188,9 @@ def _is_test_module(module) -> bool:
     )
 
 
-def _select_modules(project: Project, max_blocks: int) -> List[str]:
+def _select_modules(
+    project: Project, max_blocks: int, kind: Optional[str] = None
+) -> List[str]:
     """Which modules get a block, in the order they should be read.
 
     Mapping a package to understand the package and mapping a test suite to
@@ -1177,7 +1211,16 @@ def _select_modules(project: Project, max_blocks: int) -> List[str]:
     """
     order = [n for n in _module_order(project) if project.modules[n].funcs]
     source = [n for n in order if not _is_test_module(project.modules[n])]
-    eligible = source or order
+    # `--type test` says the suite is the subject even where source sits beside
+    # it, which is the one case the tree cannot show: a repository root holds
+    # both, and only the reader knows which they came to read. It mirrors the
+    # default exactly — the default keeps source and drops tests, this keeps
+    # tests and drops source — because a map that mixed them would be the
+    # half-of-each document neither reader wants.
+    if kind == 'test':
+        eligible = [n for n in order if _is_test_module(project.modules[n])] or order
+    else:
+        eligible = source or order
     if len(eligible) <= max_blocks:
         return eligible
     ranked = sorted(

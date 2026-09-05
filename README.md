@@ -49,6 +49,8 @@ recce pkg/ --stats                        # what it parsed, to stderr
 recce pkg/ --json                         # the intermediate state, not the map
 recce pkg/ --draft                        # a map to save and annotate, not read once
 recce pkg/ --max-source-chars 20000       # ask about long functions too, given the memory
+recce pkg/ --type app                     # draw the flow across modules; lib, test also
+
 ```
 
 `--out` will not write over a file that already exists. That is a small
@@ -102,6 +104,23 @@ displaces three per-file blocks, and the modules that lose their place are
 counted in the note at the top. A project that does not declare an entry point
 gets no such block, because the alternative is picking whichever deep function
 happens to touch the most files and calling it the way in.
+
+`--type` is how you say what the tree cannot. Plenty of applications declare no
+console script — `httpie`, `flake8` and `pre-commit` among them — and plenty of
+libraries declare one for a CLI they ship on the side, so there is no reading of
+the code that tells the two apart. `--type app` draws the flow anyway, on the
+best way in recce can find; `--type lib` says there is no one flow worth
+leading with and asks for per-file blocks only.
+
+`--type test` answers the other question a mixed tree cannot: pointed at a
+repository root holding both source and tests, recce maps the source, and this
+maps the suite instead. It is the exact mirror — the default keeps source and
+drops tests, this keeps tests and drops source — because a map that is half of
+each serves neither reader. Pointed at a directory of tests, no flag is needed;
+tests are all there is and they are the subject already.
+
+`--stats` reports which of these was in force, as `type=app` or `type=inferred`,
+so a map that surprises you says whether it was told or left to guess.
 
 It is not a call-graph dump. `pyan` and `code2flow` already draw every edge, and
 a complete graph of unfamiliar code is as hard to read as the code. recce
