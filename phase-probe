@@ -44,6 +44,29 @@ What the full run over sqlmap and nltk established, 111 unnamed runs:
   whole job for a fifteenth of the code. The rest are qualified enough to
   stand: `set up edit field`, `create results box widgets`.
 
+Two ways of asking for that judgement were then built and measured, because
+both read as obviously right. Neither works, and the table is the reason
+`--full` and `--two-stage` still exist: to keep the refutation runnable.
+
+                                    declines on   declines on
+                                    unnamed runs  author-named runs
+    run's own lines, one question         2.7%          0%
+    whole function, one question           15%         18%
+    whole function, two questions          61%         77%
+
+The right-hand column is ground truth inverted. Those are runs the author
+thought worth a heading, so a gate that judges should decline them *less* often
+than the unnamed ones. Asking with more context raises the decline rate without
+making it mean anything -- 15% against 18% is the same coin twice. Asking a
+second time, whether to keep the heading just produced, is worse than useless:
+it drops 77% of the runs an author named against 61% of the ones nobody did, so
+it is anti-correlated with the only evidence available.
+
+Context was not the problem and staging did not fix it. The model cannot tell
+whether folding a run would cost the reader something, and it is worth being
+plain about why: that is not a fact about the run, it is a fact about the run's
+place in a map the model never sees.
+
 So the shape to build is not a model that judges. It is a model that names and
 a structural gate that rejects, which is what `notes.py` already does when it
 checks a claimed loop against `n_loops`. Rejecting 7 to prevent 3 is the right
@@ -113,6 +136,42 @@ Function `{qualname}` in {module}, lines {start}-{end}:
 ```
 
 Heading, or NONE:"""
+
+
+# The second question, asked only when `--two-stage` is on. Deliberately not
+# "is this heading good": a model asked to grade its own answer agrees with
+# itself. This is a classification against a stated criterion, and the criterion
+# needs the whole function to answer -- which is the same reason `--full`
+# exists. The two ideas are one fix.
+VERDICT_PROMPT = """\
+Inside the Python function below, lines {start}-{end} have been given this
+heading, so that those lines would be replaced by it in a summary:
+
+    {label}
+
+Answer KEEP if those lines are one phase of this function among several, and
+the heading names that phase.
+
+Answer DROP if those lines are the function's main work, so that replacing them
+with the heading would hide what the function actually does.
+
+Answer with one word, KEEP or DROP, and nothing else.
+
+```python
+{source}
+```
+
+KEEP or DROP:"""
+
+
+def whole_function(func: Func) -> str:
+    """The function's own source, bounded the way `notes._source_of` bounds it."""
+    try:
+        lines = Path(func.path).read_text(errors='replace').splitlines()
+    except OSError:
+        return ''
+    body = '\n'.join(lines[func.lineno - 1 : func.end_lineno])
+    return body[:6000]
 
 
 def runs_of(func: Func) -> List[List]:
@@ -265,6 +324,16 @@ def main(argv: List[str]) -> int:
         action='store_true',
         help='find the runs and print them, without asking anything',
     )
+    parser.add_argument(
+        '--full',
+        action='store_true',
+        help="send the whole function rather than the run's own lines",
+    )
+    parser.add_argument(
+        '--two-stage',
+        action='store_true',
+        help='after a heading comes back, ask a second time whether to keep it',
+    )
     args = parser.parse_args(argv)
 
     model = None
@@ -302,6 +371,9 @@ def main(argv: List[str]) -> int:
                 print('    author: {}'.format(author))
             if args.dry_run:
                 continue
+            source = (
+                whole_function(func) if args.full else excerpt(func.path, start, end)
+            )
             answer = ask(
                 args.ollama_host,
                 model,
@@ -310,11 +382,31 @@ def main(argv: List[str]) -> int:
                     module=func.module,
                     start=start,
                     end=end,
-                    source=excerpt(func.path, start, end),
+                    source=source,
                 ),
                 args.timeout,
             )
             print('    model:  {}'.format(answer or '(empty)'))
+            if (
+                args.two_stage
+                and answer
+                and not answer.upper().startswith(('NONE', 'ERROR'))
+            ):
+                verdict = ask(
+                    args.ollama_host,
+                    model,
+                    VERDICT_PROMPT.format(
+                        label=answer,
+                        start=start,
+                        end=end,
+                        source=whole_function(func),
+                    ),
+                    args.timeout,
+                )
+                verdict = (verdict or '').strip().upper()
+                print('    verdict: {}'.format(verdict or '(empty)'))
+                if verdict.startswith('DROP'):
+                    answer = 'NONE'
             if answer and not answer.upper().startswith(('NONE', 'ERROR')):
                 print(
                     '    signals: restates name {:.0%}, covers {:.0%} of the function'.format(
