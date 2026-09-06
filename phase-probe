@@ -49,23 +49,31 @@ both read as obviously right. Neither works, and the table is the reason
 `--full` and `--two-stage` still exist: to keep the refutation runnable.
 
                                     declines on   declines on
-                                    unnamed runs  author-named runs
-    run's own lines, one question         2.7%          0%
-    whole function, one question           15%         18%
-    whole function, two questions          61%         77%
+                                    unnamed runs  author-named runs   gap
+    run's own lines, one question         2.7%          0%           -2.7
+    whole function, one question           15%         18%           +3
+    whole function, two questions          61%         77%          +16
+    rendered map, two questions            94%         95%           +1
 
 The right-hand column is ground truth inverted. Those are runs the author
 thought worth a heading, so a gate that judges should decline them *less* often
-than the unnamed ones. Asking with more context raises the decline rate without
-making it mean anything -- 15% against 18% is the same coin twice. Asking a
-second time, whether to keep the heading just produced, is worse than useless:
-it drops 77% of the runs an author named against 61% of the ones nobody did, so
-it is anti-correlated with the only evidence available.
+than the unnamed ones, and the gap should be negative and large.
 
-Context was not the problem and staging did not fix it. The model cannot tell
-whether folding a run would cost the reader something, and it is worth being
-plain about why: that is not a fact about the run, it is a fact about the run's
-place in a map the model never sees.
+It never is. The decline rate climbs from 3% to 94% as the prompt gets more
+context and a more explicit invitation to refuse, and the gap stays inside
+noise the whole way. The model is answering the framing of the question, not
+the content of the run.
+
+The fourth row was run because the third's failure had been explained by the
+model not seeing the map, which was a hypothesis rather than a finding, and the
+honest thing was to test it. So it was given the map: the rendered tree, the
+rows the fold would replace marked, and the question asked about the page
+rather than the source. It declines 94% of everything, which settles it. The
+missing context was not the problem either.
+
+What is left is the plain reading: a model can name a run of calls and cannot
+judge whether folding it is a good idea, and no prompt in this family changes
+that.
 
 So the shape to build is not a model that judges. It is a model that names and
 a structural gate that rejects, which is what `notes.py` already does when it
@@ -89,7 +97,7 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -162,6 +170,67 @@ Answer with one word, KEEP or DROP, and nothing else.
 ```
 
 KEEP or DROP:"""
+
+
+# The third question, asked only when `--map-context` is on. The two before it
+# failed for the same reason and it is worth naming: both asked about the code,
+# and whether a fold costs the reader anything is not a property of the code.
+# It is a property of the page — of what is left standing once the rows go. So
+# this one shows the rows recce would actually print, marks the ones the fold
+# would replace, and asks about the result rather than about the source.
+#
+# The failure to watch for is the one the previous two showed: if this declines
+# at the same rate on runs an author named as on runs nobody named, the model
+# is not judging and no fourth prompt will change that.
+MAP_PROMPT = """\
+Below is what a code map would print for one Python function. It is a tree of
+the calls it makes; a reader uses it to decide what to go and read.
+
+The rows marked >> would be REPLACED by this single line:
+
+    ‹ {label} ›
+
+{tree}
+
+Would a reader of the map still learn what `{qualname}` does, after that
+replacement?
+
+Answer KEEP if the heading carries what those rows were saying, so the map is
+shorter and no worse.
+
+Answer DROP if the replacement hides something a reader needed — because the
+marked rows are what the function is for, or because the heading claims more
+than it delivers.
+
+Answer with one word, KEEP or DROP, and nothing else.
+
+KEEP or DROP:"""
+
+
+def render_tree(node, run_lines: set, depth: int = 0) -> List[str]:
+    """The node as a map would print it, with the folded rows marked.
+
+    Deliberately not `render._render_block`: that formats for a terminal, with
+    bracket columns and markers, and none of that is what is being asked about.
+    What the question needs is which rows stand and which go.
+    """
+    rows = []
+    for child in node.children:
+        mark = '>>' if child.lineno in run_lines else '  '
+        bracket = '  [{}]'.format(child.bracket) if child.bracket else ''
+        rows.append('{} {}{}{}'.format(mark, '    ' * depth, child.label, bracket))
+        rows.extend(render_tree(child, run_lines, depth + 1))
+    return rows
+
+
+def function_tree(func: Func, project, graph, run: List) -> str:
+    """The rendered block for one function, with the run's rows marked."""
+    from recce import rank
+
+    node = rank._build_tree(func, project, graph, depth_cap=3)
+    lines = render_tree(node, {c.lineno for c in run})
+    head = '   {}({})'.format(func.qualname, ', '.join(func.args[:3]))
+    return '\n'.join([head] + lines[:60])
 
 
 def whole_function(func: Func) -> str:
@@ -290,9 +359,14 @@ def ask(host: str, model: str, prompt: str, timeout: float) -> Optional[str]:
     return raw.splitlines()[0].strip().strip('"\'`').rstrip('.') if raw else ''
 
 
-def collect(path: str, calibrate: bool) -> List[Tuple[Func, List, Optional[str]]]:
+def collect(path: str, calibrate: bool):
+    """The runs worth asking about, with the project and graph that found them.
+
+    Both come back because `--map-context` needs them to rebuild the tree the
+    question is about.
+    """
     project = discover(Path(path).expanduser())
-    resolve(project)
+    graph = resolve(project)
     found = []
     for func in project.funcs():
         if (func.end_lineno - func.lineno) < MIN_LOC:
@@ -304,7 +378,7 @@ def collect(path: str, calibrate: bool) -> List[Tuple[Func, List, Optional[str]]
             if not calibrate and author is not None:
                 continue
             found.append((func, run, author))
-    return found
+    return project, graph, found
 
 
 def main(argv: List[str]) -> int:
@@ -334,6 +408,11 @@ def main(argv: List[str]) -> int:
         action='store_true',
         help='after a heading comes back, ask a second time whether to keep it',
     )
+    parser.add_argument(
+        '--map-context',
+        action='store_true',
+        help='ask the second question against the rendered tree, not the source',
+    )
     args = parser.parse_args(argv)
 
     model = None
@@ -349,7 +428,7 @@ def main(argv: List[str]) -> int:
         name, _, path = target.partition('=')
         if not path:
             name, path = os.path.basename(target.rstrip('/')), target
-        found = collect(path, args.calibrate)
+        project, graph, found = collect(path, args.calibrate)
         print(
             '== {} — {} {} runs, showing {}'.format(
                 name,
@@ -388,21 +467,24 @@ def main(argv: List[str]) -> int:
             )
             print('    model:  {}'.format(answer or '(empty)'))
             if (
-                args.two_stage
+                (args.two_stage or args.map_context)
                 and answer
                 and not answer.upper().startswith(('NONE', 'ERROR'))
             ):
-                verdict = ask(
-                    args.ollama_host,
-                    model,
-                    VERDICT_PROMPT.format(
+                if args.map_context:
+                    second = MAP_PROMPT.format(
+                        label=answer,
+                        qualname=func.qualname,
+                        tree=function_tree(func, project, graph, run),
+                    )
+                else:
+                    second = VERDICT_PROMPT.format(
                         label=answer,
                         start=start,
                         end=end,
                         source=whole_function(func),
-                    ),
-                    args.timeout,
-                )
+                    )
+                verdict = ask(args.ollama_host, model, second, args.timeout)
                 verdict = (verdict or '').strip().upper()
                 print('    verdict: {}'.format(verdict or '(empty)'))
                 if verdict.startswith('DROP'):
