@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from recce import rank
 from recce.model import SPINE, TRIVIAL
 
 
@@ -649,6 +650,67 @@ def test_a_module_block_that_only_restates_the_spanning_block_is_dropped(build):
     _, _, plan_, _ = build(_uip_shaped_tree(), 'pkg', max_lines=12, kind='app')
     spanning = [b for b in plan_.blocks if b.spanning]
     assert spanning, 'expected a spanning block under --type app'
+    leads = [
+        b.roots[0].func.node_id
+        for b in plan_.blocks
+        if not b.spanning and b.roots and b.roots[0].func
+    ]
+    assert spanning[0].roots[0].func.node_id not in leads
+
+
+def test_a_restating_block_is_caught_when_the_collapsed_row_has_a_bracket(build):
+    """The case the fixture above is too simple to reach.
+
+    A collapsed `… a, b, c` row carries a bracket whenever the helpers it
+    folded call externals, and `_row_tokens` tested `bracket` before the `…`
+    prefix — so those rows contributed their literal text instead of the names
+    inside them. The block that should have been dropped was kept, because the
+    two collapsed rows fold different numbers of helpers and their labels never
+    matched.
+
+    Here `main` calls four trivial helpers that the spanning block folds into
+    one bracketed row while the module block shows them as four stubs. That
+    asymmetry is the whole bug, and the simpler fixture has no trivial helpers
+    to fold.
+    """
+    _, _, plan_, _ = build(
+        {
+            'pkg/__init__.py': '',
+            'pkg/helpers.py': '"""Helpers."""\n\nimport time\nimport uuid\n\n\n'
+            'def stamp():\n    return time.time()\n\n\n'
+            'def new_id():\n    return uuid.uuid4()\n\n\n'
+            'def tag():\n    return uuid.uuid1()\n\n\n'
+            'def mark():\n    return time.monotonic()\n',
+            'pkg/io.py': '"""IO."""\n\nimport json\n\n\n'
+            'def read(path):\n'
+            '    if path:\n        for p in path:\n            json.loads(p)\n'
+            '    return path\n',
+            'pkg/work.py': '"""Work."""\n\nimport re\n\n\n'
+            'def run(item):\n'
+            '    if item:\n        for c in item:\n            re.match(c, item)\n'
+            '    return item\n',
+            'pkg/cli.py': '"""CLI."""\n\n'
+            'from .helpers import mark, new_id, stamp, tag\n'
+            'from .io import read\n'
+            'from .work import run\n\n\n'
+            'def main(argv):\n'
+            '    data = read(argv)\n'
+            '    if not data:\n        return 1\n'
+            '    for item in data:\n        run(item)\n'
+            '    stamp()\n    new_id()\n    tag()\n    mark()\n'
+            '    return 0\n',
+        },
+        'pkg',
+        max_lines=14,
+        kind='app',
+    )
+    spanning = [b for b in plan_.blocks if b.spanning]
+    assert spanning, 'expected a spanning block under --type app'
+    # The collapsed row is what makes this fixture worth having.
+    tokens: set = set()
+    for root in spanning[0].roots:
+        rank._row_tokens(root, tokens)
+    assert {'stamp', 'new_id', 'tag', 'mark'} <= tokens, sorted(tokens)
     leads = [
         b.roots[0].func.node_id
         for b in plan_.blocks
