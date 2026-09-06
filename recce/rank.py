@@ -26,6 +26,7 @@ the slot a model fills in later.
 from __future__ import annotations
 
 import itertools
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -114,8 +115,11 @@ class Node:
     """One row in a rendered tree.
 
     A row is either a project function (`func` set) or an external call
-    (`bracket` set), never both. The collapsed-helpers row is a third case with
-    neither, carrying its text in `label`.
+    (`bracket` set), never both. The collapsed-helpers row is a third case,
+    carrying the names it folded in `label` — and a `bracket` too, when those
+    helpers call externals, so a set `bracket` does not mean the row is one.
+    Read `label` first; `_row_tokens` had this backwards and quietly stopped
+    matching the collapsed rows it was written to match.
     """
 
     label: str
@@ -1033,6 +1037,13 @@ def _blocks_with_spanning(
     return [spanning] + kept
 
 
+# `… 3 more` announces rows that were cut, and names none of them, so it is not
+# content either block can be said to carry. Counting the text would make two
+# blocks differ over how many rows each had to drop, which is a fact about their
+# budgets rather than about what they say.
+_MORE_ROW = re.compile(r'^…\s*\d+\s+more$')
+
+
 def _row_tokens(node: Node, into: set) -> None:
     """Everything one row claims, named the way another block would name it.
 
@@ -1044,13 +1055,21 @@ def _row_tokens(node: Node, into: set) -> None:
     """
     if node.func is not None:
         into.add(node.func.qualname.split('.')[-1])
+    elif node.label.startswith('…'):
+        # Before the bracket test, not after it: a collapsed row carries one
+        # whenever the helpers it folded call externals, so testing `bracket`
+        # first threw away the names and kept the literal row text. That is
+        # what stopped this firing on the map it was written for -- four of
+        # `main_uip.py`'s stubs are named only inside block one's collapsed
+        # row, and the two rows fold different numbers of helpers, so their
+        # labels never matched.
+        if not _MORE_ROW.match(node.label):
+            for name in node.label.lstrip('… ').split(','):
+                name = name.strip()
+                if name:
+                    into.add(name.split('.')[-1])
     elif node.bracket is not None:
         into.add(node.label)
-    elif node.label.startswith('…'):
-        for name in node.label.lstrip('… ').split(','):
-            name = name.strip()
-            if name:
-                into.add(name.split('.')[-1])
     else:
         into.add(node.label.rstrip('()').split('.')[-1])
     for child in node.children:
