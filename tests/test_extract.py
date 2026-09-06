@@ -421,3 +421,40 @@ def test_a_property_pair_keeps_the_getter(build):
     kept = [f for f in project.funcs() if f.qualname == 'C.enc']
     assert len(kept) == 1
     assert kept[0].n_branches == 2  # the getter, not the one-line setter
+
+
+def test_a_licence_banner_is_not_a_purpose_line(build):
+    """The failure that put a copyright notice on all eight blocks of a map.
+
+    `_header_comment` took any leading comment block, so a file whose header is
+    the house licence banner got a purpose line reading seventy-eight equals
+    signs and the word Copyright — identically, in every block of the document.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '# ==============================================\n'
+            '# Copyright (c) Example Pty Ltd. All rights reserved.\n'
+            '# ==============================================\n'
+            '\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py\n')
+    assert 'Copyright' not in text
+
+
+def test_a_punctuation_rule_is_stripped_from_a_purpose_line(build):
+    _, _, _, text = build(
+        {
+            'a.py': '# ----------------------------\n'
+            '# Convert exports into the report format.\n'
+            '# ----------------------------\n'
+            '\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py — Convert exports into the report format')
