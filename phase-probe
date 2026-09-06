@@ -64,6 +64,28 @@ context and a more explicit invitation to refuse, and the gap stays inside
 noise the whole way. The model is answering the framing of the question, not
 the content of the run.
 
+A fifth was run because all four had `think: false`, copied from `notes._ask`
+where it exists for a budget reason -- reasoning shares `num_predict` with the
+answer, and at 40 tokens it eats all of it. That is a truncation problem, not a
+verdict on reasoning, so the table above tested a model with its reasoning
+switched off and said so nowhere.
+
+Turned on, with the ceiling lifted to 2000, it splits by question. Naming does
+not converge: 7385 characters of reasoning at 2000 tokens and 28473 at 8000,
+`done_reason` still `length` and the answer still empty both times. The closed
+KEEP-or-DROP question stops on its own in three to ten seconds.
+
+So thinking was given to the second question only, which is the half that was
+failing anyway, and it made the gap worse:
+
+    two questions, no thinking     61% DROP unnamed   77% author-named   +16
+    two questions, thinking        53% DROP unnamed   86% author-named   +33
+
+with 18% of asks unreadable, the reasoning having run to the ceiling. The
+author-named side is 14 verdicts after the paragraph bound shrank that set, so
+it is a small sample and suggestive rather than decisive -- but the direction
+is the same one every other configuration showed.
+
 The fourth row was run because the third's failure had been explained by the
 model not seeing the map, which was a hypothesis rather than a finding, and the
 honest thing was to test it. So it was given the map: the rendered tree, the
@@ -212,19 +234,27 @@ Answer with one word, KEEP or DROP, and nothing else.
 KEEP or DROP:"""
 
 
-def render_tree(node, run_lines: set, depth: int = 0) -> List[str]:
+def render_tree(node, run_labels: set, depth: int = 0) -> List[str]:
     """The node as a map would print it, with the folded rows marked.
 
     Deliberately not `render._render_block`: that formats for a terminal, with
     bracket columns and markers, and none of that is what is being asked about.
     What the question needs is which rows stand and which go.
+
+    Rows are matched by label. That is looser than matching by source line and
+    can mark a second call of the same name elsewhere in the tree, which for a
+    question about what the reader is left with is the safe direction: it
+    overstates what the fold takes rather than understating it.
     """
     rows = []
     for child in node.children:
-        mark = '>>' if child.lineno in run_lines else '  '
+        # Matched on the row's own text. `Node` carried the source line while
+        # the fold lived in `rank.py`, and it does not any more, so marking by
+        # line number left this mode raising `AttributeError` on every call.
+        mark = '>>' if child.label in run_labels else '  '
         bracket = '  [{}]'.format(child.bracket) if child.bracket else ''
         rows.append('{} {}{}{}'.format(mark, '    ' * depth, child.label, bracket))
-        rows.extend(render_tree(child, run_lines, depth + 1))
+        rows.extend(render_tree(child, run_labels, depth + 1))
     return rows
 
 
@@ -233,7 +263,7 @@ def function_tree(func: Func, project, graph, run: List) -> str:
     from recce import rank
 
     node = rank._build_tree(func, project, graph, depth_cap=3)
-    lines = render_tree(node, {c.lineno for c in run})
+    lines = render_tree(node, {'{}()'.format(c.attr) for c in run})
     head = '   {}({})'.format(func.qualname, ', '.join(func.args[:3]))
     return '\n'.join([head] + lines[:60])
 
@@ -455,27 +485,40 @@ def runs_of(func: Func) -> List[List]:
     return runs
 
 
+_PHASE_CACHE: Dict[str, Dict[Tuple[str, int], List[Phase]]] = {}
+
+
 def phases_of(func: Func) -> List[Phase]:
-    """The comment-named phases of one function, parsed from its own file."""
-    try:
-        source = Path(func.path).read_text(errors='replace')
-        tree = ast.parse(source)
-    except (OSError, SyntaxError, ValueError):
-        return []
-    comments = own_line_comments(source)
-    blanks = {
-        number
-        for number, text in enumerate(source.splitlines(), start=1)
-        if not text.strip()
-    }
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == func.name
-            and node.lineno == func.lineno
-        ):
-            return _comment_phases(node, comments, blanks)
-    return []
+    """The comment-named phases of one function, parsed from its own file.
+
+    Keyed on name and end line rather than start line. `Func.lineno` points at
+    the first decorator and `ast` points at the `def`, so matching on the start
+    silently missed every decorated function -- which shrank the calibration
+    set from 25 to 15 on nltk and moved the misses into the unnamed pile, where
+    they looked like more work rather than like a bug.
+
+    Cached per file: one parse serves every function in it.
+    """
+    if func.path not in _PHASE_CACHE:
+        table: Dict[Tuple[str, int], List[Phase]] = {}
+        try:
+            source = Path(func.path).read_text(errors='replace')
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, ValueError):
+            _PHASE_CACHE[func.path] = table
+            return []
+        comments = own_line_comments(source)
+        blanks = {
+            number
+            for number, text in enumerate(source.splitlines(), start=1)
+            if not text.strip()
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end = getattr(node, 'end_lineno', node.lineno) or node.lineno
+                table[(node.name, end)] = _comment_phases(node, comments, blanks)
+        _PHASE_CACHE[func.path] = table
+    return _PHASE_CACHE[func.path].get((func.name, func.end_lineno), [])
 
 
 def named_by_author(func: Func, run: List, phases: List[Phase]) -> Optional[str]:
@@ -537,18 +580,37 @@ def excerpt(path: str, start: int, end: int, pad: int = 2) -> str:
     return '\n'.join(lines[lo:hi])
 
 
-def ask(host: str, model: str, prompt: str, timeout: float) -> Optional[str]:
-    """One blocking generate call, shaped like `notes._ask`."""
+def ask(
+    host: str, model: str, prompt: str, timeout: float, think: bool = False
+) -> Optional[str]:
+    """One blocking generate call, shaped like `notes._ask`.
+
+    `think` is off by default for the reason `notes._ask` gives: reasoning goes
+    into the same `num_predict` budget as the answer, and at 40 tokens it eats
+    all of it, so the response comes back empty and every ask reads as a
+    failure -- a truncation problem, not a verdict on reasoning.
+
+    `--think` turns it on for the second question only, and the asymmetry is
+    measured rather than tidy. Asked to *name* a run, this model does not
+    converge: 7385 characters of reasoning at a 2000-token ceiling and 28473 at
+    8000, `done_reason` still `length` and the answer still empty both times, so
+    raising the ceiling is not a fix. Asked the closed KEEP-or-DROP question it
+    stops on its own in three to ten seconds. Naming was never the half that
+    needed help.
+
+    Ollama returns the reasoning in a separate `thinking` field on this model,
+    so `response` carries the answer alone and nothing downstream changes.
+    """
     payload = json.dumps(
         {
             'model': model,
             'prompt': prompt,
             'stream': False,
-            # Every Qwen from 3.6 on reasons by default and puts the reasoning
-            # first, which eats the whole `num_predict` budget and returns an
-            # empty response. See the same field in `notes._ask`.
-            'think': False,
-            'options': {'temperature': 0.0, 'num_predict': 40},
+            'think': think,
+            'options': {
+                'temperature': 0.0,
+                'num_predict': 2000 if think else 40,
+            },
         }
     ).encode('utf-8')
     request = urllib.request.Request(
@@ -616,6 +678,11 @@ def main(argv: List[str]) -> int:
         help='after a heading comes back, ask a second time whether to keep it',
     )
     parser.add_argument(
+        '--think',
+        action='store_true',
+        help='let the model reason first, with a budget big enough to allow it',
+    )
+    parser.add_argument(
         '--map-context',
         action='store_true',
         help='ask the second question against the rendered tree, not the source',
@@ -630,7 +697,7 @@ def main(argv: List[str]) -> int:
             return 2
         print('model: {} at {}\n'.format(model, args.ollama_host))
 
-    declined = answered = 0
+    declined = answered = unreadable = 0
     for target in args.targets:
         name, _, path = target.partition('=')
         if not path:
@@ -691,11 +758,18 @@ def main(argv: List[str]) -> int:
                         end=end,
                         source=whole_function(func),
                     )
-                verdict = ask(args.ollama_host, model, second, args.timeout)
+                verdict = ask(args.ollama_host, model, second, args.timeout, args.think)
                 verdict = (verdict or '').strip().upper()
                 print('    verdict: {}'.format(verdict or '(empty)'))
                 if verdict.startswith('DROP'):
                     answer = 'NONE'
+                elif not verdict.startswith('KEEP'):
+                    # Neither word came back, usually because the reasoning ran
+                    # to the token ceiling. Counting that as KEEP would report a
+                    # failed ask as a judgement, which is the trap `notes._ask`
+                    # already warns about, so it is counted apart.
+                    unreadable += 1
+                    answer = None
             if answer and not answer.upper().startswith(('NONE', 'ERROR')):
                 print(
                     '    signals: restates name {:.0%}, covers {:.0%} of the function'.format(
@@ -711,8 +785,8 @@ def main(argv: List[str]) -> int:
     if not args.dry_run:
         total = declined + answered
         print(
-            'named {} of {} ({:.0%}), declined {}'.format(
-                answered, total, answered / total if total else 0, declined
+            'named {} of {} ({:.0%}), declined {}, unreadable {}'.format(
+                answered, total, answered / total if total else 0, declined, unreadable
             )
         )
         print(
