@@ -62,14 +62,34 @@ _DEPTH_LADDER = (6, 5, 4, 3)
 # loops, so it is something you can read and argue with — reorder these four
 # lines and you have changed what recce sacrifices.
 #
-# The order says what recce believes is worth least. Notes go before rows,
-# because a row the reader cannot see is a call they will not know about,
-# while a missing note only costs them a sentence they can get by opening the
-# file. Then externals, then depth for the same reason — a reader four levels
-# down has already left the flow the map is describing. Giving up a whole flow
-# is dearer than any of them and is not on this list: `_fit` does that only
-# once every rung here is spent.
+# The order says what recce believes is worth least. A repeated reference goes
+# first, ahead even of notes: it is the only row on the page that carries
+# nothing at all, being the second or third appearance of an edge the reader has
+# already met, and dropping it hides no call. Notes go next, because a row the
+# reader cannot see is a call they will not know about while a missing note only
+# costs them a sentence they can get by opening the file. Then externals, then
+# depth for the same reason — a reader four levels down has already left the
+# flow the map is describing. Giving up a whole flow is dearer than any of them
+# and is not on this list: `_fit` does that only once every rung here is spent.
+#
+# Dropping repeats pays for itself twice over. Measured across the corpus it
+# shows 29 more distinct functions than leaving them in, because the rows it
+# frees are spent on code the map had not reached, and it leaves fewer `… more`
+# markers than before rather than more.
+#
+# A width concession — capping children per node, so a wide tree narrows
+# instead of being cut at the end by `_truncate` — was written, measured and
+# rejected. It sounds like the graceful version of the same idea and is the
+# noisy one. Tight enough to matter (16, 8, 4) it removed every hard cut and
+# took the corpus from 14 `… more` markers to 64, spreading an announcement of
+# what is missing across every wide node, while showing 21 fewer distinct
+# functions than dropping repeats alone. Loose enough to stay quiet (20, 12) it
+# halved the hard cuts and changed little else, for triple the rungs. The
+# premise was wrong: since `_truncate` learned to cut into a subtree rather than
+# stop at it, one hard cut costs one marker in one place, and that is the
+# quieter failure.
 _CONCESSION_ORDER = (
+    ('drop_repeat_refs', (False, True)),
     ('notes', ('all', 'spine', 'none')),
     ('external_depth', (99, 2)),
     ('depth_cap', _DEPTH_LADDER),
@@ -606,6 +626,7 @@ def _build_tree(
     drop_skim: bool = False,
     external_depth: int = 99,
     notes: str = 'all',
+    drop_repeat_refs: bool = False,
 ) -> Node:
     """Expand one entry point into a row tree, honouring the current budget."""
     by_id = project.by_id()
@@ -659,7 +680,10 @@ def _build_tree(
                     if not any(c.label == reference for c in node.children):
                         seen_before = callee.node_id in referenced
                         referenced.add(callee.node_id)
-                        node.children.append(Node(label=reference, repeat=seen_before))
+                        if not (seen_before and drop_repeat_refs):
+                            node.children.append(
+                                Node(label=reference, repeat=seen_before)
+                            )
                     continue
                 if any(c.func is callee for c in node.children):
                     continue
