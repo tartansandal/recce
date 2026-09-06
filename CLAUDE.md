@@ -77,8 +77,11 @@ because breaking it makes the map actively misleading rather than merely worse.
   order of concessions as a list rather than burying it in the nesting of
   loops, so the priority is something you can read and argue with — reorder
   those lines and you have changed what recce gives up first. Notes go before
-  rows, because a hidden row is a call the reader never learns about while a
-  dropped note only costs a sentence they can get by opening the file.
+  most rows, because a hidden row is a call the reader never learns about while
+  a dropped note only costs a sentence they can get by opening the file. Ahead
+  of even the notes sits the one row that is not a call the reader could learn
+  about: a repeated cross-module reference, whose edge is a few rows above with
+  a `↑` on it.
 
   `--draft` does not break this rule, it steps outside the case the rule is
   about: a map read once on screen and a map saved and annotated for days are
@@ -204,8 +207,9 @@ docstrings, so documenting a one-line helper can push it past `_TRIVIAL_LOC` and
 promote it from a collapsed `…` row to a row of its own.
 
 Judging a model needs its own arrangement, because the rendered map is the
-wrong instrument: notes are the first concession, so at the default budget most
-of what a model wrote never reaches the page — 12 asked and 1 rendered on
+wrong instrument: notes are given up early — second on the ladder, behind only
+repeated references — so at the default budget most of what a model wrote never
+reaches the page. Twelve asked and one rendered on
 `requests`. Compare models by calling `notes.candidates` and `notes._ask`
 directly over the same candidate set and reading the sentences, and keep the
 keep rate in perspective. It has stopped discriminating: both a 7B and a 27B
