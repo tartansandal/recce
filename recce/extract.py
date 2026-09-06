@@ -528,13 +528,45 @@ def _sequence_shape(elts: List[ast.expr], opener: str, closer: str) -> str:
     return '{}{}{}'.format(opener, _literal_shape(elts[0]) or '?', closer)
 
 
+# A rule drawn in punctuation is decoration, never description. Stripping these
+# is what stops `# ===== \n # Report helpers \n # =====` rendering as a purpose
+# line that opens with seventy-eight equals signs.
+_RULE_CHARS = set('=-*_~+#')
+
+# A licence header is machinery in the same sense a shebang is: it says nothing
+# about what the file does, and every file in the tree carries the same one. It
+# has to be recognised as a whole block rather than filtered line by line,
+# because the standard notices are multi-line prose — dropping the line that
+# says "Licensed under the Apache License" leaves the line that says "you may
+# not use this file except in compliance with the License", which reads as a
+# description of the module and is worse than the banner was.
+#
+# This drops rather than guesses, in line with the asymmetry the purpose rule
+# rests on: a file whose header genuinely describes it and also says
+# "copyright" loses its purpose line, which costs the reader one sentence they
+# can get by opening the file. The alternative costs them the first line of
+# every block in the document, identically, which is what sent this here.
+_LICENCE_MARKERS = (
+    'copyright',
+    '\u00a9',
+    'spdx-license-identifier',
+    'all rights reserved',
+    'licensed under',
+    'this program is free software',
+    'permission is hereby granted',
+    'redistribution and use in source',
+)
+
+
 def _header_comment(source: str) -> Optional[str]:
     """The top-of-file comment block, if the file leads with one.
 
     This is the third of the three purpose sources the map is allowed to use,
     and it only counts when it is genuinely a header: a shebang, a coding
     line, or a PEP 723 metadata block is machinery rather than description, so
-    all three are skipped and the block after them is what gets read.
+    all three are skipped and the block after them is what gets read. A licence
+    notice and a punctuation rule are machinery by the same test, and are
+    handled by the two constants above.
     """
     lines: List[str] = []
     in_pep723 = False
@@ -554,9 +586,16 @@ def _header_comment(source: str) -> Optional[str]:
             continue
         if in_pep723:
             continue
+        if body and set(body) <= _RULE_CHARS:
+            continue
         lines.append(body)
     text = ' '.join(line for line in lines if line)
-    return first_sentence(text) if text else None
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(marker in lowered for marker in _LICENCE_MARKERS):
+        return None
+    return first_sentence(text)
 
 
 def _resolve_relative(

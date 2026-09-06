@@ -87,9 +87,39 @@ _DATA_BULLETS = 10
 # that actually needed describing.
 _SCALAR_SHAPES = frozenset({'str', 'int', 'float', 'bool', 'bytes', 'complex'})
 
+# Shapes that name the plumbing which built a value rather than the value.
+# `ASSETS_PATH — join(...)` says nothing the constant's own name did not, and
+# four of them in a row was a tenth of a real map's data section. `os.path.join`
+# is already dropped from tree rows by `graph._PLUMBING_CALLS`, so this section
+# was applying a looser standard to the same call than the trees do.
+#
+# Matched on the attribute tail alone, because a constant's shape is inferred by
+# `_literal_shape` without an import table to resolve against: `os.path.join()`,
+# `path.join()` and a bare `join()` all reach here as `join(...)`. Two names on
+# graph's list are deliberately absent. `split` collides with `str.split`, which
+# is not path plumbing. `isabs` is a predicate, so a constant holding one is a
+# bool and the scalar rule already covers it.
+_PLUMBING_SHAPES = frozenset(
+    '{}(...)'.format(tail)
+    for tail in (
+        'join',
+        'basename',
+        'dirname',
+        'splitext',
+        'abspath',
+        'normpath',
+        'realpath',
+        'relpath',
+        'expanduser',
+        'expandvars',
+        'fspath',
+    )
+)
 
-def _is_scalar(shape: str) -> bool:
-    return shape in _SCALAR_SHAPES
+
+def _is_thin(shape: str) -> bool:
+    """Whether a shape names a value's type or its plumbing, not its structure."""
+    return shape in _SCALAR_SHAPES or shape in _PLUMBING_SHAPES
 
 
 def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
@@ -321,22 +351,22 @@ def _data_section(project: Project) -> List[str]:
                 if len(cls.fields) > 4:
                     fields += ', …'
                 bullets.append('- `{}` — {}'.format(cls.name, fields))
-            elif cls.kind == 'enum':
+            elif cls.kind == 'enum' and cls.fields:
                 members = ', '.join(name for name, _ in cls.fields[:6])
                 bullets.append('- `{}` — enum: {}'.format(cls.name, members))
 
     for module in project.modules.values():
         for constant in module.constants:
-            if constant.shape and not _is_scalar(constant.shape):
+            if constant.shape and not _is_thin(constant.shape):
                 bullets.append('- `{}` — {}'.format(constant.name, constant.shape))
 
-    # Scalars come back only if nothing better exists. A module whose only
+    # Thin shapes come back only if nothing better exists. A module whose only
     # module-level names are strings still deserves them listed; a module with
     # eight record types does not need two of its ten slots spent on `str`.
     if not bullets:
         for module in project.modules.values():
             for constant in module.constants:
-                if constant.shape and _is_scalar(constant.shape):
+                if constant.shape and _is_thin(constant.shape):
                     bullets.append('- `{}` — {}'.format(constant.name, constant.shape))
 
     # Deduplicate names that several modules re-export, keeping first mention.
