@@ -183,3 +183,45 @@ def test_a_map_says_so_when_files_would_not_parse(build):
 def test_a_clean_map_carries_no_warning(build):
     _, _, _, text = build({'a.py': '"""P."""\n\n\ndef go():\n    pass\n'}, 'a.py')
     assert 'Incomplete' not in text
+
+
+def test_an_enum_with_no_readable_members_is_not_a_bullet(build):
+    """An empty `SeriesType — enum:` row, seen on a real map.
+
+    The dataclass branch beside this one already guards on having fields; the
+    enum branch did not, so a class recce classifies as an enum but reads no
+    members from spent a data slot saying nothing.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class SeriesType(Enum):\n'
+            '    """Members arrive from elsewhere."""\n\n\n'
+            'def record(m):\n'
+            '    return {"a": 1, "b": 2}\n'
+        },
+        'a.py',
+    )
+    assert 'enum:' not in text
+
+
+def test_path_plumbing_is_not_a_data_shape(build):
+    """`ASSETS_PATH — join(...)` names the call, not the value.
+
+    `os.path.join` is already dropped from tree rows as plumbing, so the data
+    section was holding the same call to a looser standard than the trees.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'import os\n\n'
+            "ASSETS_PATH = os.path.join('a', 'b')\n"
+            'LIMITS = [1, 2, 3]\n\n\n'
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '`LIMITS`' in text
+    assert 'join(...)' not in text
