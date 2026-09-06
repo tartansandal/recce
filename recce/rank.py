@@ -1017,7 +1017,80 @@ def _blocks_with_spanning(
     if spanning is None:
         return modules
     slots = -(-spanning.line_count() // max_lines)
-    return [spanning] + _module_blocks(project, graph, max_lines, _MAX_BLOCKS - slots)
+    budget = _MAX_BLOCKS - slots
+    modules = _module_blocks(project, graph, max_lines, budget, kind)
+    kept = [b for b in modules if not _restates(b, spanning)]
+    if len(kept) < len(modules):
+        # A dropped block leaves its slot free, and a module with no block at
+        # all is worth more than a second drawing of one already on the page.
+        # Rebuilt once rather than looped: the refill can only pull in modules
+        # the spanning block was not rooted in, so a second round has nothing
+        # left to drop.
+        modules = _module_blocks(
+            project, graph, max_lines, budget + (len(modules) - len(kept)), kind
+        )
+        kept = [b for b in modules if not _restates(b, spanning)]
+    return [spanning] + kept
+
+
+def _row_tokens(node: Node, into: set) -> None:
+    """Everything one row claims, named the way another block would name it.
+
+    A function reached inside its own module is a `func` row; the same function
+    reached from outside is a reference leaf with no `func` and a dotted label;
+    and either can be folded into a `…` row that still names it. The three
+    spellings have to collapse to one token or a block that says strictly less
+    will not look like it.
+    """
+    if node.func is not None:
+        into.add(node.func.qualname.split('.')[-1])
+    elif node.bracket is not None:
+        into.add(node.label)
+    elif node.label.startswith('…'):
+        for name in node.label.lstrip('… ').split(','):
+            name = name.strip()
+            if name:
+                into.add(name.split('.')[-1])
+    else:
+        into.add(node.label.rstrip('()').split('.')[-1])
+    for child in node.children:
+        _row_tokens(child, into)
+
+
+def _restates(block: Block, spanning: Block) -> bool:
+    """Whether a module block says nothing the spanning block has not said.
+
+    Blocks are deliberately self-contained and overlap between them is normal,
+    so this is not a rule against repetition. It is about the one block that
+    repeats everything: the module the spanning block is rooted in, whose block
+    starts from the same function and follows it with every crossing collapsed
+    back to a stub.
+
+    Both conditions are required, and the second is why. On the map that raised
+    this, `main_uip.py` held 58 rows, 15.5% of the document, and not one name
+    the spanning block lacked. But yt-dlp's `__init__.py` block leads with the
+    same `main` and is not a restatement: the spanning block spent its budget
+    crossing modules and gave up `re.compile` and `getpass.getpass` inside
+    `validate_options` to afford it, so the module block is where those appear.
+    Dropping on the shared root alone would have taken that away.
+
+    Comparing names rather than node ids is what lets a stub match the function
+    it stands for, and the shared root is what makes the looseness safe: two
+    unrelated functions of the same name cannot collide into a false drop
+    unless this block is already rooted where the spanning block is.
+    """
+    if not block.roots or not spanning.roots:
+        return False
+    lead, span_lead = block.roots[0].func, spanning.roots[0].func
+    if lead is None or span_lead is None or lead.node_id != span_lead.node_id:
+        return False
+    mine: set = set()
+    for root in block.roots:
+        _row_tokens(root, mine)
+    theirs: set = set()
+    for root in spanning.roots:
+        _row_tokens(root, theirs)
+    return mine <= theirs
 
 
 def _stub_rows(blocks: Sequence[Block]) -> int:
@@ -1141,6 +1214,24 @@ def _omissions(
     # The spanning block is a flow, not a module, so it does not reduce the
     # count of modules still unshown.
     shown = sum(1 for b in result.blocks if not b.spanning)
+    # With one exception. Where the module the spanning block is rooted in had
+    # its own block dropped as a restatement, that module is on the page and
+    # counting it as missing sends a reader looking for something they have
+    # already read.
+    span_root = next(
+        (
+            b.roots[0].func.module
+            for b in result.blocks
+            if b.spanning and b.roots and b.roots[0].func
+        ),
+        None,
+    )
+    if span_root is not None and not any(
+        b.roots and b.roots[0].func and b.roots[0].func.module == span_root
+        for b in result.blocks
+        if not b.spanning
+    ):
+        shown += 1
     if kind == 'test':
         # The suite is the subject and the source was set aside on purpose, so
         # what is missing is the test modules that did not fit. Source is not
