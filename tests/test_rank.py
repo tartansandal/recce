@@ -584,3 +584,74 @@ def test_a_repeat_of_a_cross_module_call_goes_first_under_pressure(build):
 
     assert not [n for n in refs(tight) if n.repeat], 'repeats survived the squeeze'
     assert refs(roomy), 'the roomy map should still show the references'
+
+
+def _uip_shaped_tree():
+    """An app whose entry module holds nothing but the entry point.
+
+    The shape that raised this: `main` calls across three other modules and its
+    own file has no second function, so the module block is the spanning block
+    redrawn with every crossing collapsed back to a stub.
+    """
+    return {
+        'pkg/__init__.py': '',
+        'pkg/cli.py': '"""CLI."""\n\n'
+        'from .io import read\n'
+        'from .work import run\n'
+        'from .out import write\n\n\n'
+        'def main(argv):\n'
+        '    data = read(argv)\n'
+        '    if not data:\n'
+        '        return 1\n'
+        '    for item in data:\n'
+        '        run(item)\n'
+        '    write(data)\n'
+        '    return 0\n',
+        'pkg/io.py': '"""IO."""\n\nimport json\n\n\n'
+        'def read(path):\n'
+        '    if path:\n'
+        '        for p in path:\n'
+        '            json.loads(p)\n'
+        '    return path\n',
+        'pkg/work.py': '"""Work."""\n\nimport re\n\n\n'
+        'def run(item):\n'
+        '    if item:\n'
+        '        for c in item:\n'
+        '            re.match(c, item)\n'
+        '    return item\n',
+        'pkg/out.py': '"""Out."""\n\nimport csv\n\n\n'
+        'def write(rows):\n'
+        '    if rows:\n'
+        '        for r in rows:\n'
+        '            csv.writer(r)\n'
+        '    return rows\n',
+    }
+
+
+def test_the_spine_list_names_a_function_once(build):
+    """A spanning block and its own module's block lead with the same function.
+
+    Listing it twice spends one of five slots telling the reader to start where
+    they were already told to start. Seen on yt-dlp and cookiecutter.
+    """
+    _, _, _, text = build(_uip_shaped_tree(), 'pkg', max_lines=12, kind='app')
+    spine = text.split('## Spine to read first')[1].split('## Legend')[0]
+    entries = [
+        line
+        for line in spine.splitlines()
+        if line.strip().startswith(('1.', '2.', '3.', '4.', '5.'))
+    ]
+    assert len(entries) == len({e.split('. ', 1)[1] for e in entries}), entries
+
+
+def test_a_module_block_that_only_restates_the_spanning_block_is_dropped(build):
+    """The 58 rows, 15.5% of a real map, that named nothing block one lacked."""
+    _, _, plan_, _ = build(_uip_shaped_tree(), 'pkg', max_lines=12, kind='app')
+    spanning = [b for b in plan_.blocks if b.spanning]
+    assert spanning, 'expected a spanning block under --type app'
+    leads = [
+        b.roots[0].func.node_id
+        for b in plan_.blocks
+        if not b.spanning and b.roots and b.roots[0].func
+    ]
+    assert spanning[0].roots[0].func.node_id not in leads

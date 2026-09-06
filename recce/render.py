@@ -207,7 +207,22 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
     # Ordered by call depth rather than by block, because the blocks are already
     # in dependency order and a list repeating it is a second table of contents.
     # Depth puts the ways in first, which is the ordering the heading promises.
-    leads = [b.roots[0].func for b in plan.blocks if b.roots and b.roots[0].func]
+    #
+    # Deduplicated, because a spanning block and the module block of the module
+    # it is rooted in lead with the same function, and listing it twice spends
+    # one of five slots telling the reader to start where they were already
+    # told to start. Seen on yt-dlp and cookiecutter as well as the map that
+    # raised it, so it is the pairing and not one codebase.
+    leads = []
+    seen_leads = set()
+    for block in plan.blocks:
+        if not block.roots or not block.roots[0].func:
+            continue
+        lead = block.roots[0].func
+        if lead.node_id in seen_leads:
+            continue
+        seen_leads.add(lead.node_id)
+        leads.append(lead)
     leads.sort(key=lambda f: (f.depth if f.depth is not None else 99, f.module))
     if plan.strategy != 'single' and leads:
         lines.append('## Spine to read first')
