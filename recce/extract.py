@@ -517,6 +517,27 @@ def _literal_shape(node: Optional[ast.AST]) -> Optional[str]:
             return type(value).__name__
         case ast.JoinedStr():
             return 'str'
+        # An enum member names its type, and the type is the shape. Lookup
+        # tables keyed on one are common and were rendering as `{?: str}`,
+        # which throws away the half of the shape worth having: five of nine
+        # data bullets on a real map said `{?: str}` and the reader could not
+        # tell which of them were keyed on the same enum.
+        #
+        # Only when the owner reads as a class. `SeriesType.PDF_REPORT` is an
+        # instance of `SeriesType`, so naming it is a fact about the value.
+        # `mod.CONSTANT` is not an instance of `mod`, so the same rule there
+        # would invent a shape rather than decline to name one -- the failure
+        # the dropped-call rule exists to prevent, in the data section. Case is
+        # the only signal available here, since `_literal_shape` runs without an
+        # import table to resolve the owner against. `self.x` falls out on the
+        # same test, which matters because `_class_fields` sends values here.
+        # Leading underscores come off first: `_NoRow._NO_ROW` and
+        # `_CompoundSelectKeyword.UNION` are sqlalchemy sentinels, and a private
+        # class is still a class.
+        case ast.Attribute():
+            _, _, dotted = _dotted_of(node)
+            owner = dotted.split('.')[-2] if '.' in dotted else ''
+            return owner if owner.lstrip('_')[:1].isupper() else None
         case _:
             return None
 
