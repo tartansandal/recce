@@ -543,3 +543,44 @@ def test_what_was_cut_is_counted_not_silently_dropped(build):
     assert marker, text
     # The count names rows that exist rather than rows that were rendered.
     assert int(marker[0].split()[-2]) > 0
+
+
+def test_a_repeat_of_a_cross_module_call_goes_first_under_pressure(build):
+    """The cheapest concession, and the only row that carries nothing.
+
+    A second appearance of a reference leaf is an edge the reader has already
+    met. Dropping it hides no call, which is why it is spent before notes.
+    """
+    files = {
+        'pkg/__init__.py': '',
+        'pkg/shared.py': (
+            '"""Shared."""\n\n\ndef helper(xs):\n    total = 0\n'
+            '    for x in xs:\n        if x:\n            total += x\n    return total\n'
+        ),
+    }
+    # Several callers into one shared module, so the reference repeats.
+    for index in range(8):
+        files['pkg/m{}.py'.format(index)] = (
+            '"""M{}."""\n\nfrom .shared import helper\n\n\n'
+            'def entry_{}(xs):\n    for x in xs:\n        if x:\n'
+            '            helper(x)\n    return helper(xs)\n'.format(index, index)
+        )
+    _, _, roomy, _ = build(files, 'pkg', max_lines=40)
+    _, _, tight, text = build(files, 'pkg', max_lines=6)
+
+    def refs(mapping):
+        return [
+            node
+            for block in mapping.blocks
+            for root in block.roots
+            for node in _iter(root)
+            if node.func is None and not node.bracket and '.' in node.label
+        ]
+
+    def _iter(node):
+        yield node
+        for child in node.children:
+            yield from _iter(child)
+
+    assert not [n for n in refs(tight) if n.repeat], 'repeats survived the squeeze'
+    assert refs(roomy), 'the roomy map should still show the references'
