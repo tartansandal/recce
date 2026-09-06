@@ -63,6 +63,17 @@
 #   cookiecutter  a small application with straight call chains: one entry
 #               reaches 68% of its functions, the most legible tree in either
 #               tier. Everything else here is a library or too big to walk.
+#   sqlmap      the era axes, where the corpus was empty. 90% of its files put
+#               the licence in the module docstring against a corpus maximum of
+#               5%, and it is the only target with no manifest at all, so it
+#               exercises the no-declared-entry-point path from the other side
+#               to mkdocs. Old, large and careless in a way nothing else here
+#               is; recce only ever parses it, and what the tool does when run
+#               is beside the point.
+#   nltk        62% licence banners and `setup.cfg` plus `setup.py` with no
+#               `pyproject.toml`, which is the packaging region faker nominally
+#               occupies and does not exercise. A large old library where
+#               almost every file opens with a notice.
 #   mkdocs      an application recce cannot follow. Its work is dispatched
 #               through a plugin registry, so one entry reaches 3% of it and the
 #               call graph stops at the registry boundary. Apps whose flow is
@@ -125,12 +136,14 @@ clone faker https://github.com/joke2k/faker
 clone yt-dlp https://github.com/yt-dlp/yt-dlp
 clone mkdocs https://github.com/mkdocs/mkdocs
 clone cookiecutter https://github.com/cookiecutter/cookiecutter
+clone sqlmap https://github.com/sqlmapproject/sqlmap
+clone nltk https://github.com/nltk/nltk
 
 # MANIFEST carries only what makes two corpora incomparable. Deliberately no
 # timestamp: a date would differ on every run and make every diff dirty.
 {
 	"$python" --version
-	for name in requests rich httpx flask toolz black sqlalchemy networkx faker yt-dlp mkdocs cookiecutter; do
+	for name in requests rich httpx flask toolz black sqlalchemy networkx faker yt-dlp mkdocs cookiecutter sqlmap nltk; do
 		echo "$name $(git -C "$repos/$name" rev-parse --short HEAD)"
 	done
 } >"$out/MANIFEST"
@@ -156,6 +169,8 @@ heldout	mkdocs	$repos/mkdocs/mkdocs
 heldout	faker	$repos/faker/faker
 heldout	networkx	$repos/networkx/networkx
 heldout	yt-dlp	$repos/yt-dlp/yt_dlp
+heldout	sqlmap	$repos/sqlmap/lib
+heldout	nltk	$repos/nltk/nltk
 "
 
 echo "$targets" | while IFS="	" read -r tier name path; do
