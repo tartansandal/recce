@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import configparser
 import os
 import re
 import tokenize
@@ -953,39 +954,92 @@ def _find_readme(directory: Path) -> Optional[str]:
 
 
 def declared_entry_points(root: Path) -> List[str]:
-    """Console scripts a `pyproject.toml` above this tree declares.
+    """Console scripts a manifest above this tree declares.
 
-    `[project.scripts]` is the only place a package states, rather than
+    A declared console script is the only place a package states, rather than
     implies, where it is meant to be entered. Everything else recce has is
     inference — a `__main__` guard, a decorator it recognises, a function
     called `main`, or the shape of the call graph — and inference is what
     produces a map that opens on a helper because nothing happened to call it.
 
-    Returns dotted `module:function` targets as written. Reading this needed
-    `tomllib`, which is the concrete thing the 3.11 floor bought: a TOML parser
-    that is not a dependency, on a tool whose whole premise is having none.
+    Two manifests say it, and both count. `[project.scripts]` in a
+    `pyproject.toml` is the modern spelling; `console_scripts` under
+    `[options.entry_points]` in a `setup.cfg` is the setuptools one, and it is
+    the same statement by the same authority. Reading only the first was an
+    accident of what got written, not a judgement that the second says less —
+    and the codebases most in need of a map are the ones least likely to have
+    been ported.
 
-    A malformed or unreadable file yields nothing. This is a bonus signal, and
-    failing a map over a `pyproject.toml` recce was not asked about would be a
-    poor trade.
+    Both are checked in each directory before moving up, because carrying a
+    `pyproject.toml` for tool configuration while metadata stays in `setup.cfg`
+    is the ordinary state of a half-migrated project, and stopping at the first
+    `pyproject.toml` would read the file that has no scripts and never reach
+    the one that does.
+
+    `setup.py` is deliberately not read. It is code, not data — the entry
+    points might be built in a loop or come back from a helper — and guessing
+    at it statically would fail silently, which is the one failure mode the
+    rest of recce is arranged to avoid.
+
+    Returns dotted `module:function` targets as written. Reading TOML needed
+    `tomllib`, which is the concrete thing the 3.11 floor bought: a parser that
+    is not a dependency, on a tool whose whole premise is having none.
+    `configparser` costs nothing on the same terms.
+
+    A malformed or unreadable manifest yields nothing and the walk continues.
+    This is a bonus signal, and failing a map over a manifest recce was not
+    asked about would be a poor trade — as would letting an unparseable
+    `pyproject.toml` hide a perfectly good `setup.cfg` beside it.
     """
     for directory in _project_dirs(root):
-        candidate = directory / 'pyproject.toml'
-        if not candidate.is_file():
-            continue
-        try:
-            with candidate.open('rb') as handle:
-                data = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError):
-            return []
-        scripts = data.get('project', {}).get('scripts', {})
-        if isinstance(scripts, dict):
-            return [str(v) for v in scripts.values()]
+        found = _pyproject_scripts(directory / 'pyproject.toml') or _setup_cfg_scripts(
+            directory / 'setup.cfg'
+        )
+        if found:
+            return found
     return []
 
 
+def _pyproject_scripts(path: Path) -> List[str]:
+    """`[project.scripts]` targets, or nothing."""
+    if not path.is_file():
+        return []
+    try:
+        with path.open('rb') as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    scripts = data.get('project', {}).get('scripts', {})
+    if not isinstance(scripts, dict):
+        return []
+    return [str(v) for v in scripts.values()]
+
+
+def _setup_cfg_scripts(path: Path) -> List[str]:
+    """`console_scripts` under `[options.entry_points]`, or nothing.
+
+    setuptools writes the section as one multi-line string, a `name = target`
+    per line, so the value is split here rather than by the parser. A line
+    without an `=` is not an entry point and is skipped rather than guessed at.
+    """
+    if not path.is_file():
+        return []
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding='utf-8')
+    except (OSError, UnicodeDecodeError, configparser.Error):
+        return []
+    raw = parser.get('options.entry_points', 'console_scripts', fallback='')
+    targets = []
+    for line in raw.splitlines():
+        _, sep, target = line.partition('=')
+        if sep and target.strip():
+            targets.append(target.strip())
+    return targets
+
+
 def _project_dirs(root: Path) -> Iterable[Path]:
-    """Directories to look in for a `pyproject.toml`, nearest first.
+    """Directories to look in for a manifest, nearest first.
 
     Walking up is right here where it was wrong for READMEs, and the
     difference is what the file claims. A README one level up describes the
