@@ -23,12 +23,30 @@ The axes are the ones recce's own behaviour turns on, not general code metrics:
   framework code that nothing in the project calls.
 - `brmed` / `locmed` — median branches and length, the raw material of `_score`.
 
+Three of these are about age rather than shape, and they are here because
+seven fixes in a row came from age and none of the shape axes could see it.
+The corpus was chosen well on shape and is nearly empty on era: house licence
+banners, enum hierarchies two deep, setuptools packaging.
+
+- `ban%` — files whose leading comment block is a licence, and `doclic%` —
+  files whose docstring summary is one. Both are silent purpose sources
+  pretending to be loud ones, and the corpus runs 0-3% on the first and 0-5%
+  on the second, so the map that found the bug was outside the whole range.
+  Note the interaction with `mdoc%`, which counts a module as documented when
+  it carries a header comment: before banners were recognised, these were the
+  codebases `mdoc%` scored as *best* documented.
+- `lenum` — classes taking their enum-ness from a local base rather than from
+  `Enum` directly. Python forbids subclassing an enum that has members, so a
+  memberless base holding shared methods is the only way to share behaviour
+  across enums, and the whole corpus contains two.
+
 Run it over candidates and the existing tier together; the useful output is not
 any single row but which regions of the space the current tier leaves empty.
 """
 
 from __future__ import annotations
 
+import ast
 import os
 import statistics
 import sys
@@ -36,13 +54,69 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from recce.extract import discover  # noqa: E402
+from recce.extract import (  # noqa: E402
+    SKIP_DIRS,
+    _is_licence,
+    discover,
+    first_sentence,
+)
 from recce.graph import resolve  # noqa: E402
 from recce.model import UNRESOLVED  # noqa: E402
 
 
 def pct(part: int, whole: int) -> float:
     return 100.0 * part / whole if whole else 0.0
+
+
+def era(path: str) -> dict:
+    """The age axes, read off the source rather than through `discover`.
+
+    Deliberately not routed through the extractor: these measure what recce is
+    given, so reading them back through the code that already filters licences
+    would report zero on exactly the codebases that have them.
+    """
+    enum_bases = {'Enum', 'IntEnum', 'StrEnum', 'Flag', 'IntFlag'}
+    banner = doclic = local_enum = files = 0
+    for f in Path(path).rglob('*.py'):
+        if any(part in SKIP_DIRS for part in f.parts):
+            continue
+        try:
+            source = f.read_text(errors='replace')
+            tree = ast.parse(source)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        files += 1
+        header = []
+        for line in source.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if header:
+                    break
+                continue
+            if not stripped.startswith('#'):
+                break
+            header.append(stripped.lstrip('#').strip())
+        if _is_licence(' '.join(header)):
+            banner += 1
+        doc = ast.get_docstring(tree)
+        if doc and _is_licence(first_sentence(doc.split('\n\n')[0]) or ''):
+            doclic += 1
+        enums = set()
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and any(
+                ast.unparse(b).split('.')[-1] in enum_bases for b in node.bases
+            ):
+                enums.add(node.name)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and any(
+                ast.unparse(b).split('.')[-1] in enums for b in node.bases
+            ):
+                local_enum += 1
+    return {
+        'ban%': pct(banner, files),
+        'doclic%': pct(doclic, files),
+        'lenum': local_enum,
+    }
 
 
 def probe(path: str) -> dict:
@@ -52,6 +126,7 @@ def probe(path: str) -> dict:
     modules = [m for m in project.modules.values() if m.funcs]
     calls = [c for f in funcs for c in f.calls]
     return {
+        **era(path),
         'mod': len(modules),
         'fn': len(funcs),
         'meth%': pct(sum(1 for f in funcs if f.is_method), len(funcs)),
@@ -65,7 +140,19 @@ def probe(path: str) -> dict:
     }
 
 
-COLUMNS = ('mod', 'fn', 'meth%', 'mdoc%', 'unres%', 'deco%', 'brmed', 'locmed')
+COLUMNS = (
+    'mod',
+    'fn',
+    'meth%',
+    'mdoc%',
+    'unres%',
+    'deco%',
+    'brmed',
+    'locmed',
+    'ban%',
+    'doclic%',
+    'lenum',
+)
 
 
 def main(argv):
@@ -83,7 +170,8 @@ def main(argv):
             print('{:<12}  ERROR {}'.format(name, exc))
             continue
         cells = ''.join(
-            '{:>8.0f}'.format(row[c]) if isinstance(row[c], float)
+            '{:>8.0f}'.format(row[c])
+            if isinstance(row[c], float)
             else '{:>8}'.format(row[c])
             for c in COLUMNS
         )

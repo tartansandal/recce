@@ -672,3 +672,83 @@ def test_a_setup_cfg_with_no_entry_points_yields_nothing(tmp_path):
 
     (tmp_path / 'setup.cfg').write_text('[metadata]\nname = x\nversion = 1.0\n')
     assert declared_entry_points(tmp_path) == []
+
+
+def test_a_licence_in_the_module_docstring_is_not_a_purpose_line(build):
+    """The banner rule stopped at `_header_comment` and left this door open.
+
+    sqlmap puts its notice in the module docstring on 90% of its files, so
+    every block of a map of it was headed with the copyright.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""\n'
+            'Copyright (c) 2006-2026 example developers (https://example.org)\n'
+            "See the file 'LICENSE' for copying permission\n"
+            '"""\n\n\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py\n')
+    assert 'Copyright' not in text
+
+
+def test_a_summary_below_a_notice_survives_it(build):
+    """One paragraph of notice is a header, and the summary below it stands."""
+    _, _, _, text = build(
+        {
+            'a.py': '"""\n'
+            'Copyright (c) 2006 Example.\n\n'
+            'Parse the config file.\n'
+            '"""\n\n\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py — Parse the config file')
+
+
+def test_a_licence_docstring_lets_the_header_comment_take_its_turn(build):
+    """Dropping the docstring hands the next source its chance, not nothing."""
+    _, _, _, text = build(
+        {
+            'a.py': '# Convert exports into the report format.\n'
+            '"""Copyright (c) 2006 Example. All rights reserved."""\n\n\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py — Convert exports into the report format')
+
+
+def test_a_full_licence_text_is_not_stepped_through(build):
+    """mkdocs' `utils/meta.py`, which the corpus caught and taste did not.
+
+    A first attempt skipped every licence paragraph and took whatever came
+    next. The full BSD text is copyright, then "Redistribution and use in
+    source and binary forms", then numbered clauses -- so it stepped over both
+    notices, landed on `1. Redistributions of source code must retain…`, and
+    headed the block `meta.py — 1`. Two paragraphs of notice means the licence
+    is the document, not a header on it.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""\n'
+            'Copyright (c) 2015, Example Author\n'
+            'All rights reserved.\n\n'
+            'Redistribution and use in source and binary forms, with or without\n'
+            'modification, are permitted provided that the conditions are met:\n\n'
+            '1. Redistributions of source code must retain the above copyright\n'
+            'notice, this list of conditions and the following disclaimer.\n'
+            '"""\n\n\n'
+            'def go():\n'
+            '    pass\n'
+        },
+        'a.py',
+    )
+    assert text.startswith('# a.py\n')
+    assert ' — 1' not in text

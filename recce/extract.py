@@ -612,12 +612,63 @@ def _header_comment(source: str) -> Optional[str]:
             continue
         lines.append(body)
     text = ' '.join(line for line in lines if line)
-    if not text:
-        return None
-    lowered = text.lower()
-    if any(marker in lowered for marker in _LICENCE_MARKERS):
+    if not text or _is_licence(text):
         return None
     return first_sentence(text)
+
+
+def _is_licence(text: str) -> bool:
+    """Whether a candidate purpose line is a licence notice rather than prose."""
+    lowered = text.lower()
+    return any(marker in lowered for marker in _LICENCE_MARKERS)
+
+
+def module_purpose(doc: Optional[str]) -> Optional[str]:
+    """A module docstring's summary, unless the summary is its licence.
+
+    The banner rule was written for `_header_comment` and stopped there, which
+    left the first and strongest of the three purpose sources unchecked. A
+    project that puts its notice in the module docstring instead of a comment
+    got the identical failure through the other door: every block of a map of
+    sqlmap is headed `Copyright (c) 2006-2026 sqlmap developers … See the file
+    'LICENSE' for copying permission`, on 90% of its files.
+
+    One paragraph may be stepped over, and only one. A short notice above a
+    real summary is a header convention and the summary below it is still the
+    answer — `Copyright (c) 2006 Foo.` then `Parse the config file.` gives the
+    second. Two paragraphs of notice means the licence is not a header on the
+    document, it *is* the document, and what follows is its body rather than a
+    summary.
+
+    The corpus settled that limit rather than taste, and against a first
+    attempt that skipped every licence paragraph and took whatever came next.
+    mkdocs' `utils/meta.py` opens with the full BSD text: copyright, then
+    "Redistribution and use in source and binary forms", then the numbered
+    clauses. Stepping over both notices landed on `1. Redistributions of source
+    code must retain…`, whose first sentence is `1`, and the block heading read
+    `meta.py — 1`. That is the same walk-into-the-licence-body failure
+    `_header_comment` drops whole blocks to avoid.
+
+    A summary with no letter in it is refused for the same reason from the
+    other end: whatever `1` is, it is not what the file is for.
+
+    Where nothing survives there is no purpose line, and `extract_module` then
+    offers the header comment and the README their turn.
+    """
+    if not doc:
+        return None
+    skipped = 0
+    for para in _strip_rest_title(doc).split('\n\n'):
+        summary = first_sentence(para)
+        if not summary:
+            continue
+        if _is_licence(summary):
+            skipped += 1
+            if skipped > 1:
+                return None
+            continue
+        return summary if any(c.isalpha() for c in summary) else None
+    return None
 
 
 def _resolve_relative(
@@ -770,7 +821,7 @@ def extract_module(
         module.parse_error = '{}: line {}'.format(exc.msg, exc.lineno)
         return module
 
-    module.doc = first_sentence(ast.get_docstring(tree))
+    module.doc = module_purpose(ast.get_docstring(tree))
     module.header_comment = None if module.doc else _header_comment(source)
     module.imports = _imports(tree, module_name, module.is_package)
 
