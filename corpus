@@ -74,11 +74,32 @@
 #               `pyproject.toml`, which is the packaging region faker nominally
 #               occupies and does not exercise. A large old library where
 #               almost every file opens with a notice.
+#   sqlmap-repo sqlmap's repository root rather than its `lib/`, which is six
+#               top-level packages beside each other -- lib, plugins, tamper,
+#               extra, tests, thirdparty. Nothing else here is that shape, and
+#               it is the shape a reader points recce at when a repository
+#               holds several packages rather than one.
+#   rich-examples  a plain directory of scripts: 36 standalone files, no
+#               package anywhere in it. `_package_root` has a branch for
+#               exactly this and nothing exercised it. It is also the only
+#               target whose purpose line comes from a README rather than a
+#               docstring, which is the third of the three purpose sources.
 #   mkdocs      an application recce cannot follow. Its work is dispatched
 #               through a plugin registry, so one entry reaches 3% of it and the
 #               call graph stops at the registry boundary. Apps whose flow is
 #               invisible to static resolution are a shape nothing else covers,
 #               and the pair brackets the range: 3% and 68% are both apps.
+#
+# The tiers are also chosen for the *shape recce is pointed at*, not only for
+# the codebase behind it, and that axis was nearly empty until it cost
+# something. Sixteen of twenty targets were a package directory; one was a
+# repository root holding one package, one a root with a src layout, one a
+# single file. The src-layout root is the only target that could show module
+# names being built with `src` in them, so `from black import ...` resolved
+# against nothing and 58 rows of a map said `[black]` where black calls black.
+# It survived because that target is there for an unrelated reason and nobody
+# read its external rows. Hence the two below, each for a shape and not for a
+# codebase.
 #
 # Three things have to be pinned or the diff fills with noise that is not the
 # change:
@@ -171,6 +192,8 @@ heldout	networkx	$repos/networkx/networkx
 heldout	yt-dlp	$repos/yt-dlp/yt_dlp
 heldout	sqlmap	$repos/sqlmap/lib
 heldout	nltk	$repos/nltk/nltk
+heldout	sqlmap-repo	$repos/sqlmap
+heldout	rich-examples	$repos/rich/examples
 "
 
 echo "$targets" | while IFS="	" read -r tier name path; do
