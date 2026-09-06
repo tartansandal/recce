@@ -612,3 +612,63 @@ def test_a_subclass_of_a_dataclass_is_not_a_dataclass(build):
     )
     kinds = {c.name: c.kind for c in project.modules['a'].classes}
     assert kinds == {'Base': 'dataclass', 'Child': 'class'}
+
+
+def test_console_scripts_are_read_from_setup_cfg(tmp_path):
+    """The setuptools spelling of the same statement.
+
+    Reading only `pyproject.toml` was an accident of what got written first,
+    not a judgement that a `setup.cfg` declares less. The codebases most in
+    need of a map are the ones least likely to have been ported.
+    """
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.cfg').write_text(
+        '[metadata]\nname = x\n\n'
+        '[options.entry_points]\nconsole_scripts =\n    x = pkg.cli:main\n'
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_a_pyproject_without_scripts_does_not_hide_a_setup_cfg(tmp_path):
+    """The ordinary state of a half-migrated project.
+
+    Tool configuration moves to `pyproject.toml` long before metadata leaves
+    `setup.cfg`, so stopping at the first `pyproject.toml` found the file with
+    no scripts in it and never reached the one that had them.
+    """
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'pyproject.toml').write_text(
+        "[build-system]\nrequires = ['setuptools']\n\n[tool.ruff]\nline-length = 88\n"
+    )
+    (tmp_path / 'setup.cfg').write_text(
+        '[options.entry_points]\nconsole_scripts =\n    x = pkg.cli:main\n'
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_pyproject_wins_over_setup_cfg_in_the_same_directory(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'pyproject.toml').write_text(
+        "[project]\nname = 'x'\n\n[project.scripts]\nx = 'pkg.new:main'\n"
+    )
+    (tmp_path / 'setup.cfg').write_text(
+        '[options.entry_points]\nconsole_scripts =\n    x = pkg.old:main\n'
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.new:main']
+
+
+def test_a_broken_setup_cfg_costs_nothing(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.cfg').write_text('[options.entry_points\nbroken')
+    assert declared_entry_points(tmp_path) == []
+
+
+def test_a_setup_cfg_with_no_entry_points_yields_nothing(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.cfg').write_text('[metadata]\nname = x\nversion = 1.0\n')
+    assert declared_entry_points(tmp_path) == []
