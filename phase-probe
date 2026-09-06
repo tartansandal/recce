@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+"""Read what a model would call a run of calls the author left unnamed.
+
+`_fold_phases` folds a run of external calls into the name the author wrote in
+a comment above it. Measured over five codebases that covers a minority of the
+opportunities — 16 of 118 runs in sqlmap, 32 of 73 in nltk — because most runs
+have no comment. Naming those is model work, and so is the judgement that goes
+with it: whether a run is machinery worth folding or the function's actual work,
+which no structural test got right. Package diversity was tried and separates a
+six-call setup run from a five-call dicom run, then fails on a nine-call dicom
+run with `os` and `numpy` mixed in.
+
+This script exists because that has to be read before it is built. The rendered
+map is the wrong instrument for judging a model — `./corpus` unsets
+`RECCE_MODEL` precisely because output that changes between runs cannot be
+diffed — so the arrangement is the one CLAUDE.md already describes for
+comparing models: ask directly over a fixed candidate set and read the answers.
+
+Two modes, and calibrate is the one to run first.
+
+`--calibrate` asks about the runs that DO carry a comment and prints the
+model's answer beside the author's. Those are ground truth: if the model cannot
+land near a phrase the author wrote, it has no business naming the ones the
+author didn't.
+
+The default mode asks about the unnamed runs, which is the actual work, and
+counts how often the model declines. A model that never declines is not
+exercising judgement, it is generating labels, and the fold would then bury the
+substance along with the machinery.
+
+What the full run over sqlmap and nltk established, 111 unnamed runs:
+
+- Naming works. 108 of 111 answered, in about two minutes on the 96GB box.
+- Judgement does not. It declined 3, which is 2.7%, on a set where a good
+  fraction should have been refused. Asking a model to decline does not work,
+  and no rewording of the NONE clause is likely to fix a 97% answer rate.
+- `coverage` is a dead signal and this is why it is still printed: median 6%,
+  maximum 63%, one run above 50%. A run of external calls is inherently a small
+  slice of its function, so the measure that was meant to separate "this run IS
+  the function" cannot, because no run is. That hypothesis was wrong.
+- `restatement` is live. It flags 7 of 108, of which two or three are genuinely
+  misleading -- `parseSqliteTableSchema` named `parse sqlite table schema`,
+  `createGithubIssue` named `create github issue` at 6% coverage, claiming the
+  whole job for a fifteenth of the code. The rest are qualified enough to
+  stand: `set up edit field`, `create results box widgets`.
+
+Two ways of asking for that judgement were then built and measured, because
+both read as obviously right. Neither works, and the table is the reason
+`--full` and `--two-stage` still exist: to keep the refutation runnable.
+
+                                    declines on   declines on
+                                    unnamed runs  author-named runs   gap
+    run's own lines, one question         2.7%          0%           -2.7
+    whole function, one question           15%         18%           +3
+    whole function, two questions          61%         77%          +16
+    rendered map, two questions            94%         95%           +1
+
+The right-hand column is ground truth inverted. Those are runs the author
+thought worth a heading, so a gate that judges should decline them *less* often
+than the unnamed ones, and the gap should be negative and large.
+
+It never is. The decline rate climbs from 3% to 94% as the prompt gets more
+context and a more explicit invitation to refuse, and the gap stays inside
+noise the whole way. The model is answering the framing of the question, not
+the content of the run.
+
+The fourth row was run because the third's failure had been explained by the
+model not seeing the map, which was a hypothesis rather than a finding, and the
+honest thing was to test it. So it was given the map: the rendered tree, the
+rows the fold would replace marked, and the question asked about the page
+rather than the source. It declines 94% of everything, which settles it. The
+missing context was not the problem either.
+
+What is left is the plain reading: a model can name a run of calls and cannot
+judge whether folding it is a good idea, and no prompt in this family changes
+that.
+
+So the shape to build is not a model that judges. It is a model that names and
+a structural gate that rejects, which is what `notes.py` already does when it
+checks a claimed loop against `n_loops`. Rejecting 7 to prevent 3 is the right
+direction under recce's asymmetry: a fold not taken costs rows, a fold taken
+wrongly sends the reader somewhere the code does not go.
+
+    ./phase-probe --dry-run sqlmap=~/.cache/recce-corpus/sqlmap/lib
+    ssh -N -L 11435:127.0.0.1:11434 dev104 &
+    ./phase-probe --calibrate --ollama-host http://127.0.0.1:11435 \
+        --model qwen3.6:35b-a3b-coding-mtp-q4_K_M nltk=...
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import io
+import json
+import os
+import re
+import sys
+import tokenize
+import urllib.error
+import urllib.request
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from recce.extract import discover  # noqa: E402
+from recce.graph import resolve  # noqa: E402
+from recce.model import EXTERNAL, Func  # noqa: E402
+from recce.notes import DEFAULT_HOST, resolve_model  # noqa: E402
+
+# A run has to be this long before folding it saves anything worth a new row.
+# Matches `rank._PHASE_MIN_ROWS`; the two are the same judgement.
+MIN_RUN = 3
+
+# Lines between two external calls before they stop reading as one run. Calls
+# are matched on source line rather than on adjacency in the rendered tree,
+# because the tree has already been through `_fit` and its order is not the
+# order the statements were written in.
+MAX_GAP = 3
+
+# Below this a function is short enough to read whole. Matches
+# `extract._PHASE_MIN_LOC`.
+MIN_LOC = 30
+
+# Deliberately close to the note prompt's register: one short line, no
+# preamble, no restating. The difference that matters is NONE — that answer is
+# the whole point of asking, because it is the judgement no structural test
+# could make, and a model that never gives it has told you it is not judging.
+PROMPT = """\
+Below is a run of consecutive calls from inside one Python function, with the
+lines around them for context.
+
+Name what this run of calls DOES, as a heading, in under 6 words. Write it the
+way a programmer writes a comment above a block: "set up output directories",
+"write the json reports", "load and sort the series".
+
+Answer NONE instead if the run is the function's real work rather than
+preparation, bookkeeping, logging or cleanup around it. NONE is a good answer
+and it is expected often.
+
+No Markdown, no quotes, no trailing full stop, no explanation.
+
+Function `{qualname}` in {module}, lines {start}-{end}:
+```python
+{source}
+```
+
+Heading, or NONE:"""
+
+
+# The second question, asked only when `--two-stage` is on. Deliberately not
+# "is this heading good": a model asked to grade its own answer agrees with
+# itself. This is a classification against a stated criterion, and the criterion
+# needs the whole function to answer -- which is the same reason `--full`
+# exists. The two ideas are one fix.
+VERDICT_PROMPT = """\
+Inside the Python function below, lines {start}-{end} have been given this
+heading, so that those lines would be replaced by it in a summary:
+
+    {label}
+
+Answer KEEP if those lines are one phase of this function among several, and
+the heading names that phase.
+
+Answer DROP if those lines are the function's main work, so that replacing them
+with the heading would hide what the function actually does.
+
+Answer with one word, KEEP or DROP, and nothing else.
+
+```python
+{source}
+```
+
+KEEP or DROP:"""
+
+
+# The third question, asked only when `--map-context` is on. The two before it
+# failed for the same reason and it is worth naming: both asked about the code,
+# and whether a fold costs the reader anything is not a property of the code.
+# It is a property of the page — of what is left standing once the rows go. So
+# this one shows the rows recce would actually print, marks the ones the fold
+# would replace, and asks about the result rather than about the source.
+#
+# The failure to watch for is the one the previous two showed: if this declines
+# at the same rate on runs an author named as on runs nobody named, the model
+# is not judging and no fourth prompt will change that.
+MAP_PROMPT = """\
+Below is what a code map would print for one Python function. It is a tree of
+the calls it makes; a reader uses it to decide what to go and read.
+
+The rows marked >> would be REPLACED by this single line:
+
+    ‹ {label} ›
+
+{tree}
+
+Would a reader of the map still learn what `{qualname}` does, after that
+replacement?
+
+Answer KEEP if the heading carries what those rows were saying, so the map is
+shorter and no worse.
+
+Answer DROP if the replacement hides something a reader needed — because the
+marked rows are what the function is for, or because the heading claims more
+than it delivers.
+
+Answer with one word, KEEP or DROP, and nothing else.
+
+KEEP or DROP:"""
+
+
+def render_tree(node, run_lines: set, depth: int = 0) -> List[str]:
+    """The node as a map would print it, with the folded rows marked.
+
+    Deliberately not `render._render_block`: that formats for a terminal, with
+    bracket columns and markers, and none of that is what is being asked about.
+    What the question needs is which rows stand and which go.
+    """
+    rows = []
+    for child in node.children:
+        mark = '>>' if child.lineno in run_lines else '  '
+        bracket = '  [{}]'.format(child.bracket) if child.bracket else ''
+        rows.append('{} {}{}{}'.format(mark, '    ' * depth, child.label, bracket))
+        rows.extend(render_tree(child, run_lines, depth + 1))
+    return rows
+
+
+def function_tree(func: Func, project, graph, run: List) -> str:
+    """The rendered block for one function, with the run's rows marked."""
+    from recce import rank
+
+    node = rank._build_tree(func, project, graph, depth_cap=3)
+    lines = render_tree(node, {c.lineno for c in run})
+    head = '   {}({})'.format(func.qualname, ', '.join(func.args[:3]))
+    return '\n'.join([head] + lines[:60])
+
+
+def whole_function(func: Func) -> str:
+    """The function's own source, bounded the way `notes._source_of` bounds it."""
+    try:
+        lines = Path(func.path).read_text(errors='replace').splitlines()
+    except OSError:
+        return ''
+    body = '\n'.join(lines[func.lineno - 1 : func.end_lineno])
+    return body[:6000]
+
+
+# ---------------------------------------------------------------------------
+# Comment-derived phases, which used to live in `recce.extract`.
+#
+# They were there to fold rows in the map and they no longer do; see the
+# rejected table in CLAUDE.md for why. They stay here because the probe needs
+# them as ground truth: a run the author put a heading over is the only
+# evidence available about which runs deserve one, and `--calibrate` is built
+# on it. Keeping them out of the library keeps recce from tokenising every file
+# it reads for a feature nothing renders.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Phase:
+    """A run of statements a comment inside a function body names."""
+
+    label: str
+    start: int
+    end: int
+
+
+# A comment that is machinery rather than a heading. These sit above a
+# statement exactly where a phase name would and say nothing about what the
+# next few lines do.
+_PRAGMA_COMMENTS = ('noqa', 'type:', 'pragma:', 'pylint:', 'mypy:', 'fmt:', 'ruff:')
+
+
+# A note to whoever maintains the code, not a name for what the next lines do.
+# Measured across six codebases these are what survives every other filter:
+# `XXX not implemented yet`, `Reference: http://bugs.python.org/issue17849`,
+# `-- End Removal --`. Each sits exactly where a heading would and names
+# nothing.
+_ASIDE_COMMENTS = (
+    'xxx',
+    'todo',
+    'fixme',
+    'hack',
+    'note:',
+    'nb:',
+    'reference',
+    'see http',
+    'see:',
+    '--',
+    'http://',
+    'https://',
+)
+
+
+# Below this a function is short enough to read whole, and naming a phase
+# inside it is ceremony. The measured shape this defends is the opposite one:
+# functions over thirty lines, where 71-92% of old codebases put an interior
+# comment and the phases are already named.
+_PHASE_MIN_LOC = 30
+
+
+# How long a comment may be and still read as a heading rather than an
+# explanation. A row label longer than this crowds out the tree it sits in.
+_PHASE_LABEL_CHARS = 52
+
+
+def own_line_comments(source: str) -> Dict[int, str]:
+    """Comments that sit on a line of their own, by line number.
+
+    A trailing comment annotates the statement it follows; a comment on its own
+    line above a run of statements is a heading for them. Only the second kind
+    can name a phase, so the distinction is made here and once per file.
+    """
+    comments: Dict[int, str] = {}
+    try:
+        # Tokenising re-processes f-string escapes on 3.12+, so a file with a
+        # dodgy one warns to stderr with `<string>` for a filename. recce reads
+        # other people's code and has no business complaining about it; black's
+        # test data put eight such lines into a corpus stats file.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+        for token in tokens:
+            if token.type != tokenize.COMMENT:
+                continue
+            if not token.line.lstrip().startswith('#'):
+                continue  # trailing: it belongs to the statement, not to a run
+            text = token.string.lstrip('#').strip()
+            if not text or text.startswith(_PRAGMA_COMMENTS):
+                continue
+            comments[token.start[0]] = text
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return {}
+    return comments
+
+
+def _comment_phases(
+    node: ast.AST, comments: Dict[int, str], blanks: Set[int]
+) -> List[Phase]:
+    """The runs of top-level statements this function's own comments name.
+
+    A phase starts at the first statement under a heading comment and runs to
+    the statement before the next heading. Only the body's top level is
+    considered: a comment inside a loop is about that iteration, not about a
+    stretch of the function.
+
+    Nothing is inferred. Where the author wrote no headings there are no
+    phases and the map is exactly as it was.
+    """
+    body = getattr(node, 'body', [])
+    start_line = getattr(node, 'lineno', 0)
+    end_line = getattr(node, 'end_lineno', start_line) or start_line
+    if end_line - start_line < _PHASE_MIN_LOC or len(body) < 2:
+        return []
+    heads: List[Tuple[int, str]] = []
+    for index, stmt in enumerate(body):
+        previous = body[index - 1].end_lineno if index else start_line
+        gap = [
+            comments[line]
+            for line in range((previous or start_line) + 1, stmt.lineno)
+            if line in comments
+        ]
+        # Exactly one line, or it is not a heading. A multi-line comment block
+        # is an argument about the code, and picking whichever of its lines
+        # happens to be short enough yields a fragment: measured over six
+        # codebases the two-or-more case produced labels like "be the way in."
+        # and "it because people are relying on it." -- the tail of a sentence
+        # whose head is on the line above.
+        # A heading is short, and the length is judged here rather than while
+        # tokenising so that a long line still counts towards the block. Doing
+        # it the other way round dropped the long lines of a paragraph before
+        # they were counted, so a three-line argument whose middle line
+        # happened to be short passed as a one-line heading.
+        if len(gap) != 1 or len(gap[0]) > _PHASE_LABEL_CHARS:
+            continue
+        lowered = gap[0].lower()
+        if lowered.startswith(_ASIDE_COMMENTS) or 'http' in lowered:
+            continue
+        # A trailing colon introduces something rather than naming it. On the
+        # map that raised this, `# Imbio IQ-UIP Findings:` labels the text of a
+        # DICOM field and reads as nonsense once it is a row of its own.
+        if gap[0].endswith(':'):
+            continue
+        heads.append((index, gap[0]))
+    phases = []
+    for position, (index, label) in enumerate(heads):
+        stop = heads[position + 1][0] if position + 1 < len(heads) else len(body)
+        last = body[_paragraph_end(body, index, stop, blanks)]
+        phases.append(
+            Phase(
+                label=label,
+                start=body[index].lineno,
+                end=getattr(last, 'end_lineno', last.lineno) or last.lineno,
+            )
+        )
+    return phases
+
+
+def _paragraph_end(body: List, index: int, stop: int, blanks: Set[int]) -> int:
+    """The last statement the heading at `index` actually covers.
+
+    Running to the next heading was wrong and the failure is worth keeping.
+    On a real map `# Write derived_from, series_instance_uid to json file` was
+    written for two calls and swallowed a third, so `write_json_patient`
+    vanished behind a label that does not mention patients. A row hidden
+    behind a name that does not cover it is the exact cost the budget ladder
+    is arranged to avoid, and here it was self-inflicted.
+
+    A blank line ends a paragraph, and a heading names the paragraph under it.
+    That is the convention the author was already following by writing the
+    comment where they did, so reading it is of a piece with reading the
+    comment itself rather than a new guess.
+    """
+    last = index
+    for position in range(index + 1, stop):
+        previous = body[position - 1]
+        previous_end = getattr(previous, 'end_lineno', previous.lineno)
+        gap = range((previous_end or previous.lineno) + 1, body[position].lineno)
+        if any(line in blanks for line in gap):
+            break
+        last = position
+    return last
+
+
+def runs_of(func: Func) -> List[List]:
+    """Runs of external calls close enough together to read as one block."""
+    external = sorted(
+        (c for c in func.calls if c.kind == EXTERNAL and c.label),
+        key=lambda c: c.lineno,
+    )
+    runs: List[List] = []
+    current: List = []
+
+    def worth_keeping(run: List) -> bool:
+        # Distinct lines, not distinct calls. `re.findall(re.escape(x))` is
+        # three external calls on one line and folding it says nothing: a
+        # phase is a run of statements, and a nested expression is one
+        # statement however many calls it contains. Two of sqlmap's first
+        # three candidates were exactly this.
+        return len({c.lineno for c in run}) >= MIN_RUN
+
+    for call in external:
+        if current and call.lineno - current[-1].lineno <= MAX_GAP:
+            current.append(call)
+            continue
+        if worth_keeping(current):
+            runs.append(current)
+        current = [call]
+    if worth_keeping(current):
+        runs.append(current)
+    return runs
+
+
+def phases_of(func: Func) -> List[Phase]:
+    """The comment-named phases of one function, parsed from its own file."""
+    try:
+        source = Path(func.path).read_text(errors='replace')
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return []
+    comments = own_line_comments(source)
+    blanks = {
+        number
+        for number, text in enumerate(source.splitlines(), start=1)
+        if not text.strip()
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func.name
+            and node.lineno == func.lineno
+        ):
+            return _comment_phases(node, comments, blanks)
+    return []
+
+
+def named_by_author(func: Func, run: List, phases: List[Phase]) -> Optional[str]:
+    """The author's own heading for this run, if they wrote one."""
+    for phase in phases:
+        if phase.start <= run[0].lineno <= phase.end:
+            return phase.label
+    return None
+
+
+# Words too common to count as a restatement when a label and a function name
+# share them.
+_STOPWORDS = frozenset(
+    {'the', 'a', 'an', 'and', 'for', 'of', 'to', 'up', 'with', 'in', 'value'}
+)
+
+
+def _words(text: str) -> set:
+    """Identifier or phrase, split into comparable words."""
+    text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text.split('.')[-1])
+    return {
+        w for w in re.split(r'[^A-Za-z0-9]+', text.lower()) if w and w not in _STOPWORDS
+    }
+
+
+def restatement(func: Func, label: str) -> float:
+    """How much of the function's own name the label gives back.
+
+    A label that restates the function is the fold going wrong: qwen3.6 named
+    `parseSqliteTableSchema`'s only run `parse sqlite table schema`, which
+    hides the function's substance behind its own name. Measured on its own
+    this over-fires -- `build_index` and `set_proxy` score 100% on labels the
+    author had also thought worth writing -- so read it beside `coverage`.
+    """
+    name = _words(func.qualname)
+    return len(name & _words(label)) / len(name) if name else 0.0
+
+
+def coverage(func: Func, run: List) -> float:
+    """How much of the function the run spans.
+
+    This is what separates a run that IS the function from a run that is one
+    phase of it. A culminating phase can restate the function's name and still
+    be worth folding; a run covering most of the body cannot, because folding
+    it folds the function.
+    """
+    span = (func.end_lineno - func.lineno) or 1
+    return (run[-1].lineno - run[0].lineno + 1) / span
+
+
+def excerpt(path: str, start: int, end: int, pad: int = 2) -> str:
+    """The run's own lines, with a little context either side."""
+    try:
+        lines = Path(path).read_text(errors='replace').splitlines()
+    except OSError:
+        return ''
+    lo = max(start - pad - 1, 0)
+    hi = min(end + pad, len(lines))
+    return '\n'.join(lines[lo:hi])
+
+
+def ask(host: str, model: str, prompt: str, timeout: float) -> Optional[str]:
+    """One blocking generate call, shaped like `notes._ask`."""
+    payload = json.dumps(
+        {
+            'model': model,
+            'prompt': prompt,
+            'stream': False,
+            # Every Qwen from 3.6 on reasons by default and puts the reasoning
+            # first, which eats the whole `num_predict` budget and returns an
+            # empty response. See the same field in `notes._ask`.
+            'think': False,
+            'options': {'temperature': 0.0, 'num_predict': 40},
+        }
+    ).encode('utf-8')
+    request = urllib.request.Request(
+        host.rstrip('/') + '/api/generate',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode('utf-8'))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return 'ERROR: {}'.format(exc)
+    raw = (body.get('response') or '').strip()
+    return raw.splitlines()[0].strip().strip('"\'`').rstrip('.') if raw else ''
+
+
+def collect(path: str, calibrate: bool):
+    """The runs worth asking about, with the project and graph that found them.
+
+    Both come back because `--map-context` needs them to rebuild the tree the
+    question is about.
+    """
+    project = discover(Path(path).expanduser())
+    graph = resolve(project)
+    found = []
+    for func in project.funcs():
+        if (func.end_lineno - func.lineno) < MIN_LOC:
+            continue
+        phases = phases_of(func)
+        for run in runs_of(func):
+            author = named_by_author(func, run, phases)
+            if calibrate and author is None:
+                continue
+            if not calibrate and author is not None:
+                continue
+            found.append((func, run, author))
+    return project, graph, found
+
+
+def main(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('targets', nargs='+', help='name=path, or just a path')
+    parser.add_argument(
+        '--calibrate',
+        action='store_true',
+        help='ask about runs the author named, and print both answers',
+    )
+    parser.add_argument('--model', default=None)
+    parser.add_argument('--ollama-host', default=DEFAULT_HOST)
+    parser.add_argument('--limit', type=int, default=25, help='runs per target')
+    parser.add_argument('--timeout', type=float, default=120.0)
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='find the runs and print them, without asking anything',
+    )
+    parser.add_argument(
+        '--full',
+        action='store_true',
+        help="send the whole function rather than the run's own lines",
+    )
+    parser.add_argument(
+        '--two-stage',
+        action='store_true',
+        help='after a heading comes back, ask a second time whether to keep it',
+    )
+    parser.add_argument(
+        '--map-context',
+        action='store_true',
+        help='ask the second question against the rendered tree, not the source',
+    )
+    args = parser.parse_args(argv)
+
+    model = None
+    if not args.dry_run:
+        model = args.model or resolve_model(args.ollama_host)
+        if not model:
+            print('no model: pass --model, or set RECCE_MODEL', file=sys.stderr)
+            return 2
+        print('model: {} at {}\n'.format(model, args.ollama_host))
+
+    declined = answered = 0
+    for target in args.targets:
+        name, _, path = target.partition('=')
+        if not path:
+            name, path = os.path.basename(target.rstrip('/')), target
+        project, graph, found = collect(path, args.calibrate)
+        print(
+            '== {} — {} {} runs, showing {}'.format(
+                name,
+                len(found),
+                'named' if args.calibrate else 'unnamed',
+                min(len(found), args.limit),
+            )
+        )
+        for func, run, author in found[: args.limit]:
+            start, end = run[0].lineno, run[-1].lineno
+            calls = ', '.join(dict.fromkeys('{}()'.format(c.attr) for c in run))
+            print(
+                '\n  {}:{}-{}  {}'.format(
+                    os.path.basename(func.path), start, end, func.qualname
+                )
+            )
+            print('    calls: {}'.format(calls[:96]))
+            if author:
+                print('    author: {}'.format(author))
+            if args.dry_run:
+                continue
+            source = (
+                whole_function(func) if args.full else excerpt(func.path, start, end)
+            )
+            answer = ask(
+                args.ollama_host,
+                model,
+                PROMPT.format(
+                    qualname=func.qualname,
+                    module=func.module,
+                    start=start,
+                    end=end,
+                    source=source,
+                ),
+                args.timeout,
+            )
+            print('    model:  {}'.format(answer or '(empty)'))
+            if (
+                (args.two_stage or args.map_context)
+                and answer
+                and not answer.upper().startswith(('NONE', 'ERROR'))
+            ):
+                if args.map_context:
+                    second = MAP_PROMPT.format(
+                        label=answer,
+                        qualname=func.qualname,
+                        tree=function_tree(func, project, graph, run),
+                    )
+                else:
+                    second = VERDICT_PROMPT.format(
+                        label=answer,
+                        start=start,
+                        end=end,
+                        source=whole_function(func),
+                    )
+                verdict = ask(args.ollama_host, model, second, args.timeout)
+                verdict = (verdict or '').strip().upper()
+                print('    verdict: {}'.format(verdict or '(empty)'))
+                if verdict.startswith('DROP'):
+                    answer = 'NONE'
+            if answer and not answer.upper().startswith(('NONE', 'ERROR')):
+                print(
+                    '    signals: restates name {:.0%}, covers {:.0%} of the function'.format(
+                        restatement(func, answer), coverage(func, run)
+                    )
+                )
+            if answer and answer.upper().startswith('NONE'):
+                declined += 1
+            elif answer and not answer.startswith('ERROR'):
+                answered += 1
+        print()
+
+    if not args.dry_run:
+        total = declined + answered
+        print(
+            'named {} of {} ({:.0%}), declined {}'.format(
+                answered, total, answered / total if total else 0, declined
+            )
+        )
+        print(
+            'A model that never declines is generating labels rather than\n'
+            'judging, and the fold would bury the substance with the machinery.'
+        )
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
