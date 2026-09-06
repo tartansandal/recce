@@ -33,7 +33,7 @@ import tokenize
 import tomllib
 import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from .model import Call, Class, Constant, Func, Module, Phase, Project
 
@@ -516,7 +516,9 @@ def own_line_comments(source: str) -> Dict[int, str]:
     return comments
 
 
-def _comment_phases(node: ast.AST, comments: Dict[int, str]) -> List[Phase]:
+def _comment_phases(
+    node: ast.AST, comments: Dict[int, str], blanks: Set[int]
+) -> List[Phase]:
     """The runs of top-level statements this function's own comments name.
 
     A phase starts at the first statement under a heading comment and runs to
@@ -556,11 +558,16 @@ def _comment_phases(node: ast.AST, comments: Dict[int, str]) -> List[Phase]:
         lowered = gap[0].lower()
         if lowered.startswith(_ASIDE_COMMENTS) or 'http' in lowered:
             continue
+        # A trailing colon introduces something rather than naming it. On the
+        # map that raised this, `# Imbio IQ-UIP Findings:` labels the text of a
+        # DICOM field and reads as nonsense once it is a row of its own.
+        if gap[0].endswith(':'):
+            continue
         heads.append((index, gap[0]))
     phases = []
     for position, (index, label) in enumerate(heads):
         stop = heads[position + 1][0] if position + 1 < len(heads) else len(body)
-        last = body[stop - 1]
+        last = body[_paragraph_end(body, index, stop, blanks)]
         phases.append(
             Phase(
                 label=label,
@@ -571,12 +578,39 @@ def _comment_phases(node: ast.AST, comments: Dict[int, str]) -> List[Phase]:
     return phases
 
 
+def _paragraph_end(body: List, index: int, stop: int, blanks: Set[int]) -> int:
+    """The last statement the heading at `index` actually covers.
+
+    Running to the next heading was wrong and the failure is worth keeping.
+    On a real map `# Write derived_from, series_instance_uid to json file` was
+    written for two calls and swallowed a third, so `write_json_patient`
+    vanished behind a label that does not mention patients. A row hidden
+    behind a name that does not cover it is the exact cost the budget ladder
+    is arranged to avoid, and here it was self-inflicted.
+
+    A blank line ends a paragraph, and a heading names the paragraph under it.
+    That is the convention the author was already following by writing the
+    comment where they did, so reading it is of a piece with reading the
+    comment itself rather than a new guess.
+    """
+    last = index
+    for position in range(index + 1, stop):
+        previous = body[position - 1]
+        previous_end = getattr(previous, 'end_lineno', previous.lineno)
+        gap = range((previous_end or previous.lineno) + 1, body[position].lineno)
+        if any(line in blanks for line in gap):
+            break
+        last = position
+    return last
+
+
 def _make_func(
     node: ast.AST,
     module: str,
     path: str,
     cls: Optional[str],
     comments: Optional[Dict[int, str]] = None,
+    blanks: Optional[Set[int]] = None,
 ) -> Func:
     (
         n_stmts,
@@ -594,7 +628,7 @@ def _make_func(
     name = node.name  # type: ignore[attr-defined]
     end = getattr(node, 'end_lineno', node.lineno) or node.lineno  # type: ignore[attr-defined]
     return Func(
-        phases=_comment_phases(node, comments or {}),
+        phases=_comment_phases(node, comments or {}, blanks or set()),
         name=name,
         qualname='{}.{}'.format(cls, name) if cls else name,
         module=module,
@@ -952,6 +986,11 @@ def extract_module(
         return module
 
     comments = own_line_comments(source)
+    blanks = {
+        number
+        for number, text in enumerate(source.splitlines(), start=1)
+        if not text.strip()
+    }
     module.doc = module_purpose(ast.get_docstring(tree))
     module.header_comment = None if module.doc else _header_comment(source)
     module.imports = _imports(tree, module_name, module.is_package)
@@ -959,7 +998,7 @@ def extract_module(
     for node in tree.body:
         if isinstance(node, _FUNC_NODES):
             module.funcs.append(
-                _make_func(node, module_name, str(path), None, comments)
+                _make_func(node, module_name, str(path), None, comments, blanks)
             )
         elif isinstance(node, ast.ClassDef):
             bases = [_dotted_of(b)[2] for b in node.bases]
@@ -967,7 +1006,9 @@ def extract_module(
             methods = []
             for stmt in node.body:
                 if isinstance(stmt, _FUNC_NODES):
-                    func = _make_func(stmt, module_name, str(path), node.name, comments)
+                    func = _make_func(
+                        stmt, module_name, str(path), node.name, comments, blanks
+                    )
                     module.funcs.append(func)
                     methods.append(func.qualname)
             module.classes.append(
