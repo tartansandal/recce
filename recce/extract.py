@@ -26,16 +26,14 @@ from __future__ import annotations
 import ast
 import builtins
 import configparser
-import io
 import os
 import re
 import tokenize
 import tomllib
-import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
-from .model import Call, Class, Constant, Func, Module, Phase, Project
+from .model import Call, Class, Constant, Func, Module, Project
 
 # Directories that are never someone's source tree, skipped on the walk. Test
 # directories are deliberately absent: a test suite is often the best available
@@ -450,168 +448,7 @@ def _dedupe_definitions(funcs: List[Func]) -> List[Func]:
     return list(ordered.values())
 
 
-# A comment that is machinery rather than a heading. These sit above a
-# statement exactly where a phase name would and say nothing about what the
-# next few lines do.
-_PRAGMA_COMMENTS = ('noqa', 'type:', 'pragma:', 'pylint:', 'mypy:', 'fmt:', 'ruff:')
-
-# A note to whoever maintains the code, not a name for what the next lines do.
-# Measured across six codebases these are what survives every other filter:
-# `XXX not implemented yet`, `Reference: http://bugs.python.org/issue17849`,
-# `-- End Removal --`. Each sits exactly where a heading would and names
-# nothing.
-_ASIDE_COMMENTS = (
-    'xxx',
-    'todo',
-    'fixme',
-    'hack',
-    'note:',
-    'nb:',
-    'reference',
-    'see http',
-    'see:',
-    '--',
-    'http://',
-    'https://',
-)
-
-# Below this a function is short enough to read whole, and naming a phase
-# inside it is ceremony. The measured shape this defends is the opposite one:
-# functions over thirty lines, where 71-92% of old codebases put an interior
-# comment and the phases are already named.
-_PHASE_MIN_LOC = 30
-
-# How long a comment may be and still read as a heading rather than an
-# explanation. A row label longer than this crowds out the tree it sits in.
-_PHASE_LABEL_CHARS = 52
-
-
-def own_line_comments(source: str) -> Dict[int, str]:
-    """Comments that sit on a line of their own, by line number.
-
-    A trailing comment annotates the statement it follows; a comment on its own
-    line above a run of statements is a heading for them. Only the second kind
-    can name a phase, so the distinction is made here and once per file.
-    """
-    comments: Dict[int, str] = {}
-    try:
-        # Tokenising re-processes f-string escapes on 3.12+, so a file with a
-        # dodgy one warns to stderr with `<string>` for a filename. recce reads
-        # other people's code and has no business complaining about it; black's
-        # test data put eight such lines into a corpus stats file.
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
-        for token in tokens:
-            if token.type != tokenize.COMMENT:
-                continue
-            if not token.line.lstrip().startswith('#'):
-                continue  # trailing: it belongs to the statement, not to a run
-            text = token.string.lstrip('#').strip()
-            if not text or text.startswith(_PRAGMA_COMMENTS):
-                continue
-            comments[token.start[0]] = text
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        return {}
-    return comments
-
-
-def _comment_phases(
-    node: ast.AST, comments: Dict[int, str], blanks: Set[int]
-) -> List[Phase]:
-    """The runs of top-level statements this function's own comments name.
-
-    A phase starts at the first statement under a heading comment and runs to
-    the statement before the next heading. Only the body's top level is
-    considered: a comment inside a loop is about that iteration, not about a
-    stretch of the function.
-
-    Nothing is inferred. Where the author wrote no headings there are no
-    phases and the map is exactly as it was.
-    """
-    body = getattr(node, 'body', [])
-    start_line = getattr(node, 'lineno', 0)
-    end_line = getattr(node, 'end_lineno', start_line) or start_line
-    if end_line - start_line < _PHASE_MIN_LOC or len(body) < 2:
-        return []
-    heads: List[Tuple[int, str]] = []
-    for index, stmt in enumerate(body):
-        previous = body[index - 1].end_lineno if index else start_line
-        gap = [
-            comments[line]
-            for line in range((previous or start_line) + 1, stmt.lineno)
-            if line in comments
-        ]
-        # Exactly one line, or it is not a heading. A multi-line comment block
-        # is an argument about the code, and picking whichever of its lines
-        # happens to be short enough yields a fragment: measured over six
-        # codebases the two-or-more case produced labels like "be the way in."
-        # and "it because people are relying on it." -- the tail of a sentence
-        # whose head is on the line above.
-        # A heading is short, and the length is judged here rather than while
-        # tokenising so that a long line still counts towards the block. Doing
-        # it the other way round dropped the long lines of a paragraph before
-        # they were counted, so a three-line argument whose middle line
-        # happened to be short passed as a one-line heading.
-        if len(gap) != 1 or len(gap[0]) > _PHASE_LABEL_CHARS:
-            continue
-        lowered = gap[0].lower()
-        if lowered.startswith(_ASIDE_COMMENTS) or 'http' in lowered:
-            continue
-        # A trailing colon introduces something rather than naming it. On the
-        # map that raised this, `# Imbio IQ-UIP Findings:` labels the text of a
-        # DICOM field and reads as nonsense once it is a row of its own.
-        if gap[0].endswith(':'):
-            continue
-        heads.append((index, gap[0]))
-    phases = []
-    for position, (index, label) in enumerate(heads):
-        stop = heads[position + 1][0] if position + 1 < len(heads) else len(body)
-        last = body[_paragraph_end(body, index, stop, blanks)]
-        phases.append(
-            Phase(
-                label=label,
-                start=body[index].lineno,
-                end=getattr(last, 'end_lineno', last.lineno) or last.lineno,
-            )
-        )
-    return phases
-
-
-def _paragraph_end(body: List, index: int, stop: int, blanks: Set[int]) -> int:
-    """The last statement the heading at `index` actually covers.
-
-    Running to the next heading was wrong and the failure is worth keeping.
-    On a real map `# Write derived_from, series_instance_uid to json file` was
-    written for two calls and swallowed a third, so `write_json_patient`
-    vanished behind a label that does not mention patients. A row hidden
-    behind a name that does not cover it is the exact cost the budget ladder
-    is arranged to avoid, and here it was self-inflicted.
-
-    A blank line ends a paragraph, and a heading names the paragraph under it.
-    That is the convention the author was already following by writing the
-    comment where they did, so reading it is of a piece with reading the
-    comment itself rather than a new guess.
-    """
-    last = index
-    for position in range(index + 1, stop):
-        previous = body[position - 1]
-        previous_end = getattr(previous, 'end_lineno', previous.lineno)
-        gap = range((previous_end or previous.lineno) + 1, body[position].lineno)
-        if any(line in blanks for line in gap):
-            break
-        last = position
-    return last
-
-
-def _make_func(
-    node: ast.AST,
-    module: str,
-    path: str,
-    cls: Optional[str],
-    comments: Optional[Dict[int, str]] = None,
-    blanks: Optional[Set[int]] = None,
-) -> Func:
+def _make_func(node: ast.AST, module: str, path: str, cls: Optional[str]) -> Func:
     (
         n_stmts,
         n_branches,
@@ -628,7 +465,6 @@ def _make_func(
     name = node.name  # type: ignore[attr-defined]
     end = getattr(node, 'end_lineno', node.lineno) or node.lineno  # type: ignore[attr-defined]
     return Func(
-        phases=_comment_phases(node, comments or {}, blanks or set()),
         name=name,
         qualname='{}.{}'.format(cls, name) if cls else name,
         module=module,
@@ -985,30 +821,20 @@ def extract_module(
         module.parse_error = '{}: line {}'.format(exc.msg, exc.lineno)
         return module
 
-    comments = own_line_comments(source)
-    blanks = {
-        number
-        for number, text in enumerate(source.splitlines(), start=1)
-        if not text.strip()
-    }
     module.doc = module_purpose(ast.get_docstring(tree))
     module.header_comment = None if module.doc else _header_comment(source)
     module.imports = _imports(tree, module_name, module.is_package)
 
     for node in tree.body:
         if isinstance(node, _FUNC_NODES):
-            module.funcs.append(
-                _make_func(node, module_name, str(path), None, comments, blanks)
-            )
+            module.funcs.append(_make_func(node, module_name, str(path), None))
         elif isinstance(node, ast.ClassDef):
             bases = [_dotted_of(b)[2] for b in node.bases]
             decorators = _decorator_names(node)
             methods = []
             for stmt in node.body:
                 if isinstance(stmt, _FUNC_NODES):
-                    func = _make_func(
-                        stmt, module_name, str(path), node.name, comments, blanks
-                    )
+                    func = _make_func(stmt, module_name, str(path), node.name)
                     module.funcs.append(func)
                     methods.append(func.qualname)
             module.classes.append(

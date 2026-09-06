@@ -243,6 +243,50 @@ again. Before proposing any of these, read why it failed.
 | Fold cross-module trivia into `…` | `rank._build_tree` | saves four rows corpus-wide, and a row naming another file is the one thing a per-module block cannot otherwise say |
 | Reach as an app/library classifier | `corpus` header | detects small and statically legible; ranks `requests` above `httpie`, `flake8` and `poetry` |
 | Cap children per node | `rank._CONCESSION_ORDER` | 14 omission markers become 64, for fewer functions shown than dropping repeats alone |
+| Fold a run of externals under the author's comment | `phase-probe` | bounded to what the comment covers it folds nothing; unbounded it hides calls |
+| Ask a model whether a fold is a good idea | `phase-probe` | four prompts, 3% to 94% declines, and the gap against ground truth never opens |
+
+The last two came out of one attempt and are worth more than a row each,
+because the idea behind them keeps arriving: a reader annotating a real map
+replaced twenty-five rows of `full_uip` with six phrases like `<sanity checks
+and defaults>`, and doing that automatically looks obviously worthwhile.
+
+Poor code leaves a phase of work inline where good code makes it a function, so
+the map inherits the missing name — six calls to `pathlib`, `logging`, `numpy`
+and `os` arrive as six rows with nothing to call them. Measured over six
+codebases, 71-92% of functions past thirty lines in old code carry interior
+comments against 34-40% in `rich` and `httpx`, so the name is usually already
+written and reading it beats guessing it.
+
+It fails on reach, not on naming. A comment names the paragraph under it, and
+the runs recce folds are longer than that paragraph. Running a phase to the
+next heading produced twelve folds across the corpus and every one over-reached
+— on `imbio_uip`, `# Write derived_from, series_instance_uid to json file` took
+a third row and hid `write_json_patient`; nltk's `# Start with our
+security-enforcing redirect handler` covers exactly one statement and was
+stretched over three. Bounded honestly at the blank line, the twelve become
+zero. 69 phases across four codebases still carry three or more external calls,
+and none of them land in the eight modules a map renders.
+
+Handing the judgement to a model fails differently, and the table is the
+result:
+
+|                                | declines on unnamed | on author-named | gap |
+|---|---|---|---|
+| run's own lines, one question  | 2.7% | 0%  | -2.7 |
+| whole function, one question   | 15%  | 18% | +3   |
+| whole function, two questions  | 61%  | 77% | +16  |
+| rendered map, two questions    | 94%  | 95% | +1   |
+
+The right column is ground truth inverted — those are runs an author thought
+worth a heading, so a gate that judges should decline them *less*. The decline
+rate climbs with context and with a plainer invitation to refuse, and the gap
+stays inside noise the whole way: the model answers the framing, not the run.
+Naming is not the problem. qwen3.6 named 108 of 111 runs in two minutes and
+several answers beat the comment they were measured against.
+
+`./phase-probe` is what remains, and all four modes stay runnable. A negative
+result nobody can reproduce is an opinion.
 
 The pattern worth internalising: each was a property of the *code* offered as a
 proxy for a property of the *map*. The ones that survived are measured on the

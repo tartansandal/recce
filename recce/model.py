@@ -54,26 +54,6 @@ class Call:
 
 
 @dataclass
-class Phase:
-    """A run of statements a comment inside a function body names.
-
-    Poor code leaves a phase of work inline where good code would have made it
-    a function, so the map inherits the missing name: the phase arrives as a
-    run of sibling call rows with nothing to call it. Usually the author named
-    it anyway, in a comment, and that is what this records — read off the file,
-    never inferred, so it carries the same authority as a purpose line.
-
-    `label` is the comment text verbatim, which is what makes the row worth
-    having: it is greppable, so the reader can find the lines it stands for
-    without the row spending characters on a line number.
-    """
-
-    label: str
-    start: int
-    end: int
-
-
-@dataclass
 class Func:
     """A module-level function or a method.
 
@@ -112,7 +92,6 @@ class Func:
     fan_in: int = 0
     role: str = KEEP
     note: Optional[str] = None
-    phases: List[Phase] = field(default_factory=list)
 
     @property
     def node_id(self) -> str:
