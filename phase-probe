@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Read what a model would call a run of calls the author left unnamed.
+
+`_fold_phases` folds a run of external calls into the name the author wrote in
+a comment above it. Measured over five codebases that covers a minority of the
+opportunities — 16 of 118 runs in sqlmap, 32 of 73 in nltk — because most runs
+have no comment. Naming those is model work, and so is the judgement that goes
+with it: whether a run is machinery worth folding or the function's actual work,
+which no structural test got right. Package diversity was tried and separates a
+six-call setup run from a five-call dicom run, then fails on a nine-call dicom
+run with `os` and `numpy` mixed in.
+
+This script exists because that has to be read before it is built. The rendered
+map is the wrong instrument for judging a model — `./corpus` unsets
+`RECCE_MODEL` precisely because output that changes between runs cannot be
+diffed — so the arrangement is the one CLAUDE.md already describes for
+comparing models: ask directly over a fixed candidate set and read the answers.
+
+Two modes, and calibrate is the one to run first.
+
+`--calibrate` asks about the runs that DO carry a comment and prints the
+model's answer beside the author's. Those are ground truth: if the model cannot
+land near a phrase the author wrote, it has no business naming the ones the
+author didn't.
+
+The default mode asks about the unnamed runs, which is the actual work, and
+counts how often the model declines. A model that never declines is not
+exercising judgement, it is generating labels, and the fold would then bury the
+substance along with the machinery.
+
+    ./phase-probe --dry-run sqlmap=~/.cache/recce-corpus/sqlmap/lib
+    ssh -N -L 11435:127.0.0.1:11434 dev104 &
+    ./phase-probe --calibrate --ollama-host http://127.0.0.1:11435 \
+        --model qwen3.6:35b-a3b-coding-mtp-q4_K_M nltk=...
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from recce.extract import discover  # noqa: E402
+from recce.graph import resolve  # noqa: E402
+from recce.model import EXTERNAL, Func  # noqa: E402
+from recce.notes import DEFAULT_HOST, resolve_model  # noqa: E402
+
+# A run has to be this long before folding it saves anything worth a new row.
+# Matches `rank._PHASE_MIN_ROWS`; the two are the same judgement.
+MIN_RUN = 3
+
+# Lines between two external calls before they stop reading as one run. Calls
+# are matched on source line rather than on adjacency in the rendered tree,
+# because the tree has already been through `_fit` and its order is not the
+# order the statements were written in.
+MAX_GAP = 3
+
+# Below this a function is short enough to read whole. Matches
+# `extract._PHASE_MIN_LOC`.
+MIN_LOC = 30
+
+# Deliberately close to the note prompt's register: one short line, no
+# preamble, no restating. The difference that matters is NONE — that answer is
+# the whole point of asking, because it is the judgement no structural test
+# could make, and a model that never gives it has told you it is not judging.
+PROMPT = """\
+Below is a run of consecutive calls from inside one Python function, with the
+lines around them for context.
+
+Name what this run of calls DOES, as a heading, in under 6 words. Write it the
+way a programmer writes a comment above a block: "set up output directories",
+"write the json reports", "load and sort the series".
+
+Answer NONE instead if the run is the function's real work rather than
+preparation, bookkeeping, logging or cleanup around it. NONE is a good answer
+and it is expected often.
+
+No Markdown, no quotes, no trailing full stop, no explanation.
+
+Function `{qualname}` in {module}, lines {start}-{end}:
+```python
+{source}
+```
+
+Heading, or NONE:"""
+
+
+def runs_of(func: Func) -> List[List]:
+    """Runs of external calls close enough together to read as one block."""
+    external = sorted(
+        (c for c in func.calls if c.kind == EXTERNAL and c.label),
+        key=lambda c: c.lineno,
+    )
+    runs: List[List] = []
+    current: List = []
+
+    def worth_keeping(run: List) -> bool:
+        # Distinct lines, not distinct calls. `re.findall(re.escape(x))` is
+        # three external calls on one line and folding it says nothing: a
+        # phase is a run of statements, and a nested expression is one
+        # statement however many calls it contains. Two of sqlmap's first
+        # three candidates were exactly this.
+        return len({c.lineno for c in run}) >= MIN_RUN
+
+    for call in external:
+        if current and call.lineno - current[-1].lineno <= MAX_GAP:
+            current.append(call)
+            continue
+        if worth_keeping(current):
+            runs.append(current)
+        current = [call]
+    if worth_keeping(current):
+        runs.append(current)
+    return runs
+
+
+def named_by_author(func: Func, run: List) -> Optional[str]:
+    """The author's own heading for this run, if they wrote one."""
+    for phase in func.phases:
+        if phase.start <= run[0].lineno <= phase.end:
+            return phase.label
+    return None
+
+
+# Words too common to count as a restatement when a label and a function name
+# share them.
+_STOPWORDS = frozenset(
+    {'the', 'a', 'an', 'and', 'for', 'of', 'to', 'up', 'with', 'in', 'value'}
+)
+
+
+def _words(text: str) -> set:
+    """Identifier or phrase, split into comparable words."""
+    text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text.split('.')[-1])
+    return {
+        w for w in re.split(r'[^A-Za-z0-9]+', text.lower()) if w and w not in _STOPWORDS
+    }
+
+
+def restatement(func: Func, label: str) -> float:
+    """How much of the function's own name the label gives back.
+
+    A label that restates the function is the fold going wrong: qwen3.6 named
+    `parseSqliteTableSchema`'s only run `parse sqlite table schema`, which
+    hides the function's substance behind its own name. Measured on its own
+    this over-fires -- `build_index` and `set_proxy` score 100% on labels the
+    author had also thought worth writing -- so read it beside `coverage`.
+    """
+    name = _words(func.qualname)
+    return len(name & _words(label)) / len(name) if name else 0.0
+
+
+def coverage(func: Func, run: List) -> float:
+    """How much of the function the run spans.
+
+    This is what separates a run that IS the function from a run that is one
+    phase of it. A culminating phase can restate the function's name and still
+    be worth folding; a run covering most of the body cannot, because folding
+    it folds the function.
+    """
+    span = (func.end_lineno - func.lineno) or 1
+    return (run[-1].lineno - run[0].lineno + 1) / span
+
+
+def excerpt(path: str, start: int, end: int, pad: int = 2) -> str:
+    """The run's own lines, with a little context either side."""
+    try:
+        lines = Path(path).read_text(errors='replace').splitlines()
+    except OSError:
+        return ''
+    lo = max(start - pad - 1, 0)
+    hi = min(end + pad, len(lines))
+    return '\n'.join(lines[lo:hi])
+
+
+def ask(host: str, model: str, prompt: str, timeout: float) -> Optional[str]:
+    """One blocking generate call, shaped like `notes._ask`."""
+    payload = json.dumps(
+        {
+            'model': model,
+            'prompt': prompt,
+            'stream': False,
+            # Every Qwen from 3.6 on reasons by default and puts the reasoning
+            # first, which eats the whole `num_predict` budget and returns an
+            # empty response. See the same field in `notes._ask`.
+            'think': False,
+            'options': {'temperature': 0.0, 'num_predict': 40},
+        }
+    ).encode('utf-8')
+    request = urllib.request.Request(
+        host.rstrip('/') + '/api/generate',
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode('utf-8'))
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return 'ERROR: {}'.format(exc)
+    raw = (body.get('response') or '').strip()
+    return raw.splitlines()[0].strip().strip('"\'`').rstrip('.') if raw else ''
+
+
+def collect(path: str, calibrate: bool) -> List[Tuple[Func, List, Optional[str]]]:
+    project = discover(Path(path).expanduser())
+    resolve(project)
+    found = []
+    for func in project.funcs():
+        if (func.end_lineno - func.lineno) < MIN_LOC:
+            continue
+        for run in runs_of(func):
+            author = named_by_author(func, run)
+            if calibrate and author is None:
+                continue
+            if not calibrate and author is not None:
+                continue
+            found.append((func, run, author))
+    return found
+
+
+def main(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('targets', nargs='+', help='name=path, or just a path')
+    parser.add_argument(
+        '--calibrate',
+        action='store_true',
+        help='ask about runs the author named, and print both answers',
+    )
+    parser.add_argument('--model', default=None)
+    parser.add_argument('--ollama-host', default=DEFAULT_HOST)
+    parser.add_argument('--limit', type=int, default=25, help='runs per target')
+    parser.add_argument('--timeout', type=float, default=120.0)
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='find the runs and print them, without asking anything',
+    )
+    args = parser.parse_args(argv)
+
+    model = None
+    if not args.dry_run:
+        model = args.model or resolve_model(args.ollama_host)
+        if not model:
+            print('no model: pass --model, or set RECCE_MODEL', file=sys.stderr)
+            return 2
+        print('model: {} at {}\n'.format(model, args.ollama_host))
+
+    declined = answered = 0
+    for target in args.targets:
+        name, _, path = target.partition('=')
+        if not path:
+            name, path = os.path.basename(target.rstrip('/')), target
+        found = collect(path, args.calibrate)
+        print(
+            '== {} — {} {} runs, showing {}'.format(
+                name,
+                len(found),
+                'named' if args.calibrate else 'unnamed',
+                min(len(found), args.limit),
+            )
+        )
+        for func, run, author in found[: args.limit]:
+            start, end = run[0].lineno, run[-1].lineno
+            calls = ', '.join(dict.fromkeys('{}()'.format(c.attr) for c in run))
+            print(
+                '\n  {}:{}-{}  {}'.format(
+                    os.path.basename(func.path), start, end, func.qualname
+                )
+            )
+            print('    calls: {}'.format(calls[:96]))
+            if author:
+                print('    author: {}'.format(author))
+            if args.dry_run:
+                continue
+            answer = ask(
+                args.ollama_host,
+                model,
+                PROMPT.format(
+                    qualname=func.qualname,
+                    module=func.module,
+                    start=start,
+                    end=end,
+                    source=excerpt(func.path, start, end),
+                ),
+                args.timeout,
+            )
+            print('    model:  {}'.format(answer or '(empty)'))
+            if answer and not answer.upper().startswith(('NONE', 'ERROR')):
+                print(
+                    '    signals: restates name {:.0%}, covers {:.0%} of the function'.format(
+                        restatement(func, answer), coverage(func, run)
+                    )
+                )
+            if answer and answer.upper().startswith('NONE'):
+                declined += 1
+            elif answer and not answer.startswith('ERROR'):
+                answered += 1
+        print()
+
+    if not args.dry_run:
+        total = declined + answered
+        print(
+            'named {} of {} ({:.0%}), declined {}'.format(
+                answered, total, answered / total if total else 0, declined
+            )
+        )
+        print(
+            'A model that never declines is generating labels rather than\n'
+            'judging, and the fold would bury the substance with the machinery.'
+        )
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
