@@ -534,3 +534,81 @@ def test_a_module_attribute_is_not_a_shape(build):
         'a.py',
     )
     assert '- `_PATHS` — {?: str}' in text
+
+
+def test_an_enum_subclassing_a_local_enum_is_still_an_enum(build):
+    """The enum that was named five times and defined nowhere.
+
+    Python forbids subclassing an enum that has members, so a memberless base
+    holding shared methods is the only way to share behaviour across enums.
+    `_class_kind` reads base names against a fixed list, so it saw `Enum` on
+    the base and `SeriesType` on the subclass carrying the members, and the two
+    halves cancelled into the enum being absent from the map entirely.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class SeriesType(Enum):\n'
+            '    """A parent class, with no members of its own."""\n\n'
+            '    @classmethod\n'
+            '    def has_value(cls, value):\n'
+            '        return value in cls._value2member_map_\n\n\n'
+            'class ReportType(SeriesType):\n'
+            "    PDF_REPORT = 'pdf'\n"
+            "    SR_REPORT = 'sr'\n\n\n"
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '- `ReportType` — enum: PDF_REPORT, SR_REPORT' in text
+    # The memberless base still earns no data bullet, and still should not.
+    # It keeps its tree rows: `has_value` is a real method a reader can call.
+    assert '- `SeriesType`' not in text
+
+
+def test_kind_inheritance_carries_through_two_levels(build):
+    """Resolved to a fixed point, not in source order."""
+    project, _, _, _ = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class Root(Enum):\n'
+            '    pass\n\n\n'
+            'class Middle(Root):\n'
+            '    pass\n\n\n'
+            'class Leaf(Middle):\n'
+            '    ONE = 1\n\n\n'
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    kinds = {c.name: c.kind for c in project.modules['a'].classes}
+    assert kinds == {'Root': 'enum', 'Middle': 'enum', 'Leaf': 'enum'}
+
+
+def test_a_subclass_of_a_dataclass_is_not_a_dataclass(build):
+    """Kind inheritance is enum-only, and this is why.
+
+    Subclassing an enum makes you an enum. Subclassing a dataclass does not
+    make you a dataclass unless you carry the decorator too, so a general rule
+    would be wrong for three of the four kinds.
+    """
+    project, _, _, _ = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from dataclasses import dataclass\n\n\n'
+            '@dataclass\n'
+            'class Base:\n'
+            '    x: int\n\n\n'
+            'class Child(Base):\n'
+            '    y: int\n\n\n'
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    kinds = {c.name: c.kind for c in project.modules['a'].classes}
+    assert kinds == {'Base': 'dataclass', 'Child': 'class'}
