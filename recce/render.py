@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from typing import List, Optional
 
+from .graph import is_stdlib
 from .model import Func, Project
 from .rank import Block, Node, Plan
 
@@ -122,6 +124,76 @@ def _is_thin(shape: str) -> bool:
     return shape in _SCALAR_SHAPES or shape in _PLUMBING_SHAPES
 
 
+# How many packages the foreign-rows line names before it stops listing.
+_FOREIGN_NAMED = 3
+
+
+def _foreign_labels(node: Node, counts: Counter) -> int:
+    """Count rows leaving for a package outside the standard library.
+
+    A row is counted once however many packages its bracket holds, because the
+    sentence is about rows. The per-package tallies beside it are row counts
+    too, so they can sum to more than the total — a collapsed `…` row carrying
+    three packages is one row that touches three.
+
+    The standard library is excluded, and that exclusion is doing most of the
+    work. With it in, requests reads `os 10, urllib3 8, platform 4` and the one
+    name that says anything is buried; without it, `urllib3 8`. A reader
+    already knows what `os.makedirs` does. What they cannot know without being
+    told is which packages they would have to go and learn.
+    """
+    rows = 0
+    if node.bracket:
+        packages = {name.strip() for name in node.bracket.split(',') if name.strip()}
+        foreign = {name for name in packages if not is_stdlib(name)}
+        if foreign:
+            rows += 1
+            for name in foreign:
+                counts[name] += 1
+    for child in node.children:
+        rows += _foreign_labels(child, counts)
+    return rows
+
+
+def _foreign_note(plan: Plan) -> Optional[str]:
+    """How much of this map is other people's code, and whose.
+
+    On a package that mostly does its own work this is a small true number. On
+    one that is mostly glue it is the shape of the thing, and a reader can
+    otherwise only get it by counting rows by hand: the map that asked for this
+    spends 93 of 310 rows in three sibling packages, which is the architecture
+    and is nowhere stated.
+
+    It reports rather than concludes, and the distinction is the whole design.
+    An earlier draft led with the names and called it "built on", which says
+    the same thing about `rich` reaching pygments for syntax highlighting in 2%
+    of its rows as about a wrapper spending 30% of its rows in the package it
+    wraps. Only one of those is a fact about the architecture, and the number
+    is what tells them apart, so the number goes first and no claim is attached
+    to it.
+
+    Absent when nothing leaves, because `0 of 253 rows` is a line that says
+    nothing. yt-dlp, faker and toolz are each entirely standard library at the
+    default budget.
+    """
+    counts: Counter = Counter()
+    foreign = total = 0
+    for block in plan.blocks:
+        for root in block.roots:
+            total += root.line_count()
+            foreign += _foreign_labels(root, counts)
+    if not foreign or not total:
+        return None
+    named = counts.most_common(_FOREIGN_NAMED)
+    listed = ', '.join('{} {}'.format(name, rows) for name, rows in named)
+    rest = len(counts) - len(named)
+    if rest:
+        listed += ', and {} more'.format(rest)
+    return '{} of {} rows call a package outside the standard library: {}.'.format(
+        foreign, total, listed
+    )
+
+
 def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
     """Render the whole document."""
     lines: List[str] = []
@@ -170,6 +242,11 @@ def render(project: Project, plan: Plan, base: Optional[str] = None) -> str:
                     'module is' if plan.omitted_tests == 1 else 'modules are',
                 )
             )
+        lines.append('')
+
+    foreign = _foreign_note(plan)
+    if foreign:
+        lines.append(foreign)
         lines.append('')
 
     trees: List[str] = []
