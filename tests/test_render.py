@@ -225,3 +225,54 @@ def test_path_plumbing_is_not_a_data_shape(build):
     )
     assert '`LIMITS`' in text
     assert 'join(...)' not in text
+
+
+def test_the_header_says_how_much_of_the_map_is_other_peoples_code(build):
+    """The fact a wrapper's map contains and never states.
+
+    On the codebase that asked for this, 93 of 310 rows sit in three sibling
+    packages — the architecture, obtainable otherwise only by counting rows.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'import os\n'
+            'import yaml\n'
+            'import requests\n\n\n'
+            'def go(path):\n'
+            '    if path:\n'
+            '        for item in path:\n'
+            '            yaml.safe_load(item)\n'
+            '            requests.get(item)\n'
+            '    os.makedirs(path)\n'
+            '    return path\n'
+        },
+        'a.py',
+    )
+    line = next(
+        line for line in text.splitlines() if 'outside the standard library' in line
+    )
+    # `os` is excluded: a reader knows what `os.makedirs` does. The two they
+    # would have to go and learn are named.
+    assert 'yaml 1' in line
+    assert 'requests 1' in line
+    assert ' os ' not in line
+
+
+def test_no_such_line_when_nothing_leaves_the_standard_library(build):
+    """`0 of 253 rows` is a line that says nothing, so it is not written."""
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'import os\n'
+            'import json\n\n\n'
+            'def go(path):\n'
+            '    if path:\n'
+            '        for item in path:\n'
+            '            json.dumps(item)\n'
+            '    os.makedirs(path)\n'
+            '    return path\n'
+        },
+        'a.py',
+    )
+    assert 'outside the standard library' not in text
