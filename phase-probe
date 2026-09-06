@@ -28,6 +28,28 @@ counts how often the model declines. A model that never declines is not
 exercising judgement, it is generating labels, and the fold would then bury the
 substance along with the machinery.
 
+What the full run over sqlmap and nltk established, 111 unnamed runs:
+
+- Naming works. 108 of 111 answered, in about two minutes on the 96GB box.
+- Judgement does not. It declined 3, which is 2.7%, on a set where a good
+  fraction should have been refused. Asking a model to decline does not work,
+  and no rewording of the NONE clause is likely to fix a 97% answer rate.
+- `coverage` is a dead signal and this is why it is still printed: median 6%,
+  maximum 63%, one run above 50%. A run of external calls is inherently a small
+  slice of its function, so the measure that was meant to separate "this run IS
+  the function" cannot, because no run is. That hypothesis was wrong.
+- `restatement` is live. It flags 7 of 108, of which two or three are genuinely
+  misleading -- `parseSqliteTableSchema` named `parse sqlite table schema`,
+  `createGithubIssue` named `create github issue` at 6% coverage, claiming the
+  whole job for a fifteenth of the code. The rest are qualified enough to
+  stand: `set up edit field`, `create results box widgets`.
+
+So the shape to build is not a model that judges. It is a model that names and
+a structural gate that rejects, which is what `notes.py` already does when it
+checks a claimed loop against `n_loops`. Rejecting 7 to prevent 3 is the right
+direction under recce's asymmetry: a fold not taken costs rows, a fold taken
+wrongly sends the reader somewhere the code does not go.
+
     ./phase-probe --dry-run sqlmap=~/.cache/recce-corpus/sqlmap/lib
     ssh -N -L 11435:127.0.0.1:11434 dev104 &
     ./phase-probe --calibrate --ollama-host http://127.0.0.1:11435 \
