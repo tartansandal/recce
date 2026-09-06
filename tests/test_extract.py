@@ -458,3 +458,79 @@ def test_a_punctuation_rule_is_stripped_from_a_purpose_line(build):
         'a.py',
     )
     assert text.startswith('# a.py — Convert exports into the report format')
+
+
+def test_an_enum_keyed_table_names_its_key_type(build):
+    """`{?: str}` threw away the half of the shape worth having.
+
+    Five of nine data bullets on a real map read `{?: str}`, and the reader
+    could not tell which of them were keyed on the same enum.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class SeriesType(Enum):\n'
+            '    PDF = 1\n'
+            '    SR = 2\n\n\n'
+            "_PREFIXES = {SeriesType.PDF: 'p', SeriesType.SR: 's'}\n\n\n"
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '- `_PREFIXES` — {SeriesType: str}' in text
+
+
+def test_a_constant_holding_an_enum_member_names_the_enum(build):
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class SeriesType(Enum):\n'
+            '    PDF = 1\n\n\n'
+            'DEFAULT_KIND = SeriesType.PDF\n\n\n'
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '- `DEFAULT_KIND` — SeriesType' in text
+
+
+def test_a_private_class_is_still_a_class(build):
+    """The guard reads case to tell a class from a module, and a leading
+    underscore hid three sqlalchemy sentinels from it -- `_NoRow._NO_ROW` and
+    `_CompoundSelectKeyword.UNION` among them."""
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'from enum import Enum\n\n\n'
+            'class _NoRow(Enum):\n'
+            '    NO_ROW = 1\n\n\n'
+            "_SENTINELS = {_NoRow.NO_ROW: 'x'}\n\n\n"
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '- `_SENTINELS` — {_NoRow: str}' in text
+
+
+def test_a_module_attribute_is_not_a_shape(build):
+    """`mod.CONSTANT` is not an instance of `mod`.
+
+    Naming the owner there would invent a shape rather than decline to name
+    one, which is the data section's version of guessing an edge.
+    """
+    _, _, _, text = build(
+        {
+            'a.py': '"""P."""\n\n'
+            'import config\n\n'
+            "_PATHS = {config.DEFAULT: 'x'}\n\n\n"
+            'def go(x):\n'
+            '    return x\n'
+        },
+        'a.py',
+    )
+    assert '- `_PATHS` — {?: str}' in text
