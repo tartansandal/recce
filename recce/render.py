@@ -53,6 +53,11 @@ _LEGEND = (
         '`…` more — trivial helpers folded into one row, or rows cut to fit',
     ),
     (
+        re.compile('‹'),
+        '`‹ name ›` — a run of calls the author named in a comment, folded '
+        'into one row; the name is that comment, so it greps',
+    ),
+    (
         re.compile(r'\[[^\]]+\]\s*$', re.M),
         '`[name]` external — a call leaving the project, named by its package',
     ),

@@ -31,7 +31,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .graph import Graph, external_display, is_stdlib
-from .model import EXTERNAL, KEEP, PROJECT, SKIM, SPINE, TRIVIAL, Func, Project
+from .model import (
+    EXTERNAL,
+    KEEP,
+    PROJECT,
+    SKIM,
+    SPINE,
+    TRIVIAL,
+    Func,
+    Phase,
+    Project,
+)
 
 # Decorators that mean "a framework calls this", so the function is a way in
 # even though nothing in the project calls it.
@@ -127,6 +137,10 @@ class Node:
     ret: Optional[str] = None
     marker: str = ''
     bracket: Optional[str] = None
+    # The source line the call was written on, for external rows only. It is
+    # what lets `_fold_phases` decide which of the enclosing function's phases
+    # a row belongs to, and it is never rendered.
+    lineno: Optional[int] = None
     children: List[Node] = field(default_factory=list)
     repeat: bool = False
     note: Optional[str] = None
@@ -731,7 +745,9 @@ def _build_tree(
             ):
                 display = '{}()'.format(external_display(call))
                 if not any(c.label == display and c.bracket for c in node.children):
-                    node.children.append(Node(label=display, bracket=call.label))
+                    node.children.append(
+                        Node(label=display, bracket=call.label, lineno=call.lineno)
+                    )
 
         if trivial:
             node.children.append(
@@ -740,9 +756,87 @@ def _build_tree(
                     bracket=', '.join(trivial_labels[:3]) or None,
                 )
             )
+        _fold_phases(node, func)
         return node
 
     return expand(root, 0, set())
+
+
+# What a phase has to fold to be worth its row. Two rows become one and the
+# document is a row shorter for a new construct the reader has to learn, which
+# is not a trade. Three is where the name starts paying for itself.
+_PHASE_MIN_ROWS = 3
+
+
+def _fold_phases(node: Node, func: Func) -> None:
+    """Replace runs of external rows with the name the author gave them.
+
+    Poor code leaves a phase of work inline where good code makes it a
+    function, so the map inherits the missing name: six calls to `pathlib`,
+    `logging`, `numpy` and `os` arrive as six rows with nothing to call them,
+    where a factored codebase would have shown one row and a note. Usually the
+    author named it anyway, in a comment above the run, and `Func.phases`
+    carries those names.
+
+    Only runs of external rows are folded, and this is the line that keeps the
+    change honest. A row naming another file is the one thing a per-module
+    block cannot otherwise say, so a project call inside a phase keeps its own
+    row and interrupts the run — the same asymmetry that stops cross-module
+    trivia collapsing into `…`. What is folded is what the reader was least
+    likely to follow anyway, which is also where the rows are: 62% of a real
+    map, and 37% of it in runs of three or more.
+
+    Nothing is lost that the reader cannot get back. The label is the author's
+    comment verbatim, so it greps, and the packages of what went ride up onto
+    the row exactly as they do on a `…` row.
+    """
+    if not func.phases or not node.children:
+        return
+    folded: List[Node] = []
+    run: List[Node] = []
+    current: Optional[Phase] = None
+
+    def flush() -> None:
+        nonlocal run, current
+        if current is not None and len(run) >= _PHASE_MIN_ROWS:
+            labels: List[str] = []
+            for child in run:
+                if child.bracket and child.bracket not in labels:
+                    labels.append(child.bracket)
+            folded.append(
+                Node(
+                    label='‹ {} ›'.format(current.label),
+                    bracket=', '.join(labels[:3]) or None,
+                )
+            )
+        else:
+            folded.extend(run)
+        run = []
+        current = None
+
+    for child in node.children:
+        phase = _phase_of(child, func)
+        if phase is not None and phase is current:
+            run.append(child)
+            continue
+        flush()
+        if phase is None:
+            folded.append(child)
+        else:
+            current = phase
+            run = [child]
+    flush()
+    node.children = folded
+
+
+def _phase_of(child: Node, func: Func) -> Optional[Phase]:
+    """The phase an external row falls inside, if any."""
+    if child.bracket is None or child.lineno is None:
+        return None
+    for phase in func.phases:
+        if phase.start <= child.lineno <= phase.end:
+            return phase
+    return None
 
 
 def _external_cutoff(label: str, external_depth: int) -> int:

@@ -717,3 +717,71 @@ def test_a_restating_block_is_caught_when_the_collapsed_row_has_a_bracket(build)
         if not b.spanning and b.roots and b.roots[0].func
     ]
     assert spanning[0].roots[0].func.node_id not in leads
+
+
+def test_a_named_run_of_externals_folds_into_one_row(build):
+    """The phase a comment names, folded — the shape the hand-edited map wanted.
+
+    A reader annotating a real map replaced six rows of `pathlib`, `logging`,
+    `numpy` and `os` calls with `<sanity checks and defaults>`. The author had
+    already written that name in a comment above them.
+    """
+    body = '\n'.join(
+        [
+            '"""M."""',
+            '',
+            'import os',
+            'import json',
+            'import time',
+            'import glob',
+            '',
+            '',
+            'def go(argv):',
+            '    """Do it."""',
+            '    # sanity checks and defaults',
+            '    os.makedirs(argv)',
+            '    time.time()',
+            '    glob.glob(argv)',
+            '    json.dumps(argv)',
+            '',
+            '    # the actual work',
+            '    if argv:',
+            '        for item in argv:',
+            '            os.stat(item)',
+            '    return argv',
+        ]
+        + ['    x = {}'.format(n) for n in range(30)]
+    )
+    _, _, _, text = build({'a.py': body + '\n'}, 'a.py', max_lines=40)
+    assert '‹ sanity checks and defaults ›' in text
+    # What it folded is still named, the way a `…` row names what it folded.
+    row = next(
+        line for line in text.splitlines() if '‹' in line and '─' not in line[:2]
+    )
+    assert '[' in row, row
+    # And the legend explains the new mark only when the mark is present.
+    assert '`‹ name ›`' in text
+
+
+def test_a_run_with_no_comment_is_left_alone(build):
+    """Nothing is inferred: no heading, no fold, and the rows stand."""
+    body = '\n'.join(
+        [
+            '"""M."""',
+            '',
+            'import os',
+            'import json',
+            'import time',
+            '',
+            '',
+            'def go(argv):',
+            '    """Do it."""',
+            '    os.makedirs(argv)',
+            '    time.time()',
+            '    json.dumps(argv)',
+        ]
+        + ['    x = {}'.format(n) for n in range(30)]
+    )
+    _, _, _, text = build({'a.py': body + '\n'}, 'a.py', max_lines=40)
+    assert '‹' not in text
+    assert 'os.makedirs()' in text
