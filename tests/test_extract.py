@@ -752,3 +752,80 @@ def test_a_full_licence_text_is_not_stepped_through(build):
     )
     assert text.startswith('# a.py\n')
     assert ' — 1' not in text
+
+
+def test_console_scripts_are_read_from_a_literal_setup_py(tmp_path):
+    """faker's spelling: a literal dict passed straight to `setup()`."""
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.py').write_text(
+        'from setuptools import setup\n\n'
+        'setup(\n'
+        "    name='x',\n"
+        '    entry_points={\n'
+        '        "console_scripts": ["x=pkg.cli:main"],\n'
+        '        "pytest11": ["x = pkg.plugin"],\n'
+        '    },\n'
+        ')\n'
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_console_scripts_are_read_from_a_name_bound_to_a_literal(tmp_path):
+    """nltk's spelling: the INI string form, bound to a name and passed by it."""
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.py').write_text(
+        'from setuptools import setup\n\n'
+        'console_scripts = """\n'
+        '[console_scripts]\n'
+        'x=pkg.cli:main\n'
+        '"""\n\n'
+        "setup(name='x', entry_points=console_scripts)\n"
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_a_setup_call_under_a_main_guard_is_still_found(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.py').write_text(
+        'from setuptools import setup\n\n'
+        "if __name__ == '__main__':\n"
+        "    setup(name='x', entry_points={'console_scripts': ['x=pkg.cli:main']})\n"
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.cli:main']
+
+
+def test_computed_entry_points_are_declined_rather_than_guessed(tmp_path):
+    """The objection to reading `setup.py` survives, narrowed to its real scope.
+
+    A wrong way in leads the whole document, so anything that is not a literal
+    or a name bound to one yields nothing and the map is as it was.
+    """
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.py').write_text(
+        'from setuptools import setup\n\n'
+        'def build_entry_points():\n'
+        "    return {'console_scripts': ['x=pkg.cli:main']}\n\n"
+        "setup(name='x', entry_points=build_entry_points())\n"
+    )
+    assert declared_entry_points(tmp_path) == []
+
+
+def test_pyproject_and_setup_cfg_both_win_over_setup_py(tmp_path):
+    from recce.extract import declared_entry_points
+
+    (tmp_path / 'setup.py').write_text(
+        "from setuptools import setup\n\nsetup(name='x', "
+        "entry_points={'console_scripts': ['x=pkg.old:main']})\n"
+    )
+    (tmp_path / 'setup.cfg').write_text(
+        '[options.entry_points]\nconsole_scripts =\n    x = pkg.mid:main\n'
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.mid:main']
+    (tmp_path / 'pyproject.toml').write_text(
+        "[project]\nname = 'x'\n\n[project.scripts]\nx = 'pkg.new:main'\n"
+    )
+    assert declared_entry_points(tmp_path) == ['pkg.new:main']

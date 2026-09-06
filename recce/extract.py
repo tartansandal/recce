@@ -1027,10 +1027,15 @@ def declared_entry_points(root: Path) -> List[str]:
     `pyproject.toml` would read the file that has no scripts and never reach
     the one that does.
 
-    `setup.py` is deliberately not read. It is code, not data — the entry
-    points might be built in a loop or come back from a helper — and guessing
-    at it statically would fail silently, which is the one failure mode the
-    rest of recce is arranged to avoid.
+    `setup.py` is read too, but only where it is stating a fact rather than
+    computing one. It is code, and the objection to reading it stands: entry
+    points built in a loop or returned from a helper cannot be had without
+    running it, and a wrong way in leads the whole document, which is what
+    `rank.declared_ways_in` exists to prevent. What changed is the scope — a
+    literal, or a name bound to one in the same file, is a declaration as plain
+    as any TOML table, and everything else is declined in silence. Measured
+    over thirteen projects, the only two `setup.py` files that name entry
+    points at all are both in that first category.
 
     Returns dotted `module:function` targets as written. Reading TOML needed
     `tomllib`, which is the concrete thing the 3.11 floor bought: a parser that
@@ -1043,8 +1048,10 @@ def declared_entry_points(root: Path) -> List[str]:
     `pyproject.toml` hide a perfectly good `setup.cfg` beside it.
     """
     for directory in _project_dirs(root):
-        found = _pyproject_scripts(directory / 'pyproject.toml') or _setup_cfg_scripts(
-            directory / 'setup.cfg'
+        found = (
+            _pyproject_scripts(directory / 'pyproject.toml')
+            or _setup_cfg_scripts(directory / 'setup.cfg')
+            or _setup_py_scripts(directory / 'setup.py')
         )
         if found:
             return found
@@ -1064,6 +1071,78 @@ def _pyproject_scripts(path: Path) -> List[str]:
     if not isinstance(scripts, dict):
         return []
     return [str(v) for v in scripts.values()]
+
+
+def _setup_py_scripts(path: Path) -> List[str]:
+    """`console_scripts` from a literal `entry_points=` in `setup.py`.
+
+    Read, never run. The keyword is looked for anywhere in the file, so it does
+    not matter whether `setup()` sits at module level or under a `__main__`
+    guard. Its value is taken when it is a literal, or a plain name bound to a
+    literal at module level — nltk writes the second form, binding
+    `console_scripts` to a string and passing the name — and declined
+    otherwise, which is the whole of the safety here.
+    """
+    if not path.is_file():
+        return []
+    try:
+        tree = ast.parse(path.read_text(errors='replace'))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    bound: Dict[str, object] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                try:
+                    bound[target.id] = ast.literal_eval(node.value)
+                except (ValueError, TypeError, SyntaxError, MemoryError):
+                    continue
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.keyword) or node.arg != 'entry_points':
+            continue
+        try:
+            return _console_scripts(ast.literal_eval(node.value))
+        except (ValueError, TypeError, SyntaxError, MemoryError):
+            if isinstance(node.value, ast.Name):
+                return _console_scripts(bound.get(node.value.id))
+            return []
+    return []
+
+
+def _console_scripts(value: object) -> List[str]:
+    """The console-script targets of an `entry_points` value, either spelling.
+
+    setuptools accepts a mapping of group to `name = target` entries, which is
+    what faker writes, and the same thing as one INI string, which is what nltk
+    writes. Both are parsed here so the caller does not have to care which it
+    found; anything else yields nothing.
+    """
+    if isinstance(value, str):
+        parser = configparser.ConfigParser()
+        try:
+            parser.read_string(value)
+        except configparser.Error:
+            return []
+        if not parser.has_section('console_scripts'):
+            return []
+        return [target.strip() for _, target in parser.items('console_scripts')]
+    if isinstance(value, dict):
+        entries = value.get('console_scripts') or []
+        if isinstance(entries, str):
+            entries = [entries]
+        if not isinstance(entries, (list, tuple)):
+            return []
+        targets = []
+        for entry in entries:
+            if not isinstance(entry, str):
+                continue
+            _, sep, target = entry.partition('=')
+            if sep and target.strip():
+                targets.append(target.strip())
+        return targets
+    return []
 
 
 def _setup_cfg_scripts(path: Path) -> List[str]:
