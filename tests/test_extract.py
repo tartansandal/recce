@@ -829,3 +829,37 @@ def test_pyproject_and_setup_cfg_both_win_over_setup_py(tmp_path):
         "[project]\nname = 'x'\n\n[project.scripts]\nx = 'pkg.new:main'\n"
     )
     assert declared_entry_points(tmp_path) == ['pkg.new:main']
+
+
+def test_a_src_layout_package_is_named_the_way_it_is_imported(tmp_path):
+    """The gap that made a project's calls to itself look external.
+
+    Pointed at a repository root, every module under `src/` was named
+    `src.pkg.thing`, so `from pkg import thing` matched nothing and the call
+    resolved as a call out of the project. 58 rows of black-repo's map said
+    `[black]` where black calls black.
+    """
+    (tmp_path / 'src' / 'pkg').mkdir(parents=True)
+    (tmp_path / 'src' / 'pkg' / '__init__.py').write_text('')
+    (tmp_path / 'src' / 'pkg' / 'core.py').write_text('def work(x):\n    return x\n')
+    (tmp_path / 'tests').mkdir()
+    (tmp_path / 'tests' / 'test_core.py').write_text(
+        'from pkg.core import work\n\n\ndef test_work():\n    assert work(1) == 1\n'
+    )
+    project = discover(tmp_path)
+    assert 'pkg.core' in project.modules, sorted(project.modules)
+    assert 'src.pkg.core' not in project.modules
+    # The test module keeps its path-derived name, `tests` being no package —
+    # and its import now resolves against the package's real name.
+    assert project.modules['tests.test_core'].imports['work'] == 'pkg.core.work'
+
+
+def test_a_loose_script_keeps_its_path_so_names_stay_unique(tmp_path):
+    """Re-anchoring everything collides; black's test data holds nineteen
+    files called `a.py`, `b.py` and `c.py` in directories with no `__init__`."""
+    for where in ('cases', 'other'):
+        (tmp_path / 'data' / where).mkdir(parents=True)
+        (tmp_path / 'data' / where / 'a.py').write_text('def go():\n    pass\n')
+    project = discover(tmp_path)
+    assert 'data.cases.a' in project.modules, sorted(project.modules)
+    assert 'data.other.a' in project.modules

@@ -30,6 +30,7 @@ import os
 import re
 import tokenize
 import tomllib
+import warnings
 from pathlib import Path
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
@@ -816,7 +817,13 @@ def extract_module(
         is_package=path.name == '__init__.py',
     )
     try:
-        tree = ast.parse(source, filename=str(path))
+        # Parsing evaluates string literals, so a file with a stray escape
+        # warns to stderr about code recce is only reading. `own_line_comments`
+        # already silences the same noise from tokenising; black's test data
+        # put eight such lines into a corpus stats file through this path.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            tree = ast.parse(source, filename=str(path))
     except SyntaxError as exc:
         module.parse_error = '{}: line {}'.format(exc.msg, exc.lineno)
         return module
@@ -955,7 +962,27 @@ def _read_source(path: Path) -> str:
 
 
 def _module_name_for(path: Path, root: Path) -> str:
-    """Dotted name for a file, relative to the tree root recce was given."""
+    """Dotted name for a file: the name the code that imports it would write.
+
+    A file inside a package is named from its package root, whatever recce was
+    pointed at above it. `src` is not a package and never was — it carries no
+    `__init__.py` — so it has no business being a name component, and while it
+    was one, every module under a src layout got a name nothing imports it by.
+
+    That is not cosmetic. Module names are the keys the graph is built on, so
+    `tests/test_black.py` writing `from black import ...` looked up `black`,
+    found only `src.black`, matched nothing, and became an external call. 58
+    rows of black-repo's map said `[black]` where the project calls itself, and
+    the resolver was doing exactly as told: it drops what it cannot name.
+
+    Only files that sit in a package are re-anchored. A loose script keeps its
+    path-derived name because that is what keeps it unique — re-anchoring
+    everything collides, and black's test data is the proof, holding nineteen
+    files called `a.py`, `b.py` and `c.py`. Measured across six repository
+    roots, this rule collides nowhere.
+    """
+    if (path.parent / '__init__.py').exists():
+        root = _package_root(path.parent)
     rel = path.relative_to(root)
     parts = list(rel.parts)
     parts[-1] = parts[-1][: -len('.py')]
@@ -1086,7 +1113,9 @@ def _setup_py_scripts(path: Path) -> List[str]:
     if not path.is_file():
         return []
     try:
-        tree = ast.parse(path.read_text(errors='replace'))
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            tree = ast.parse(path.read_text(errors='replace'))
     except (OSError, SyntaxError, ValueError):
         return []
     bound: Dict[str, object] = {}
