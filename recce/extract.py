@@ -836,7 +836,50 @@ def extract_module(
             by_class.setdefault(func.cls, []).append(func.qualname)
     for cls in module.classes:
         cls.methods = by_class.get(cls.name, [])
+    _inherit_enum_kind(module.classes)
     return module
+
+
+def _inherit_enum_kind(classes: List[Class]) -> None:
+    """Let a class take `enum` from a base defined in the same module.
+
+    `_class_kind` reads base names against a fixed list, so it sees `Enum` and
+    misses a local class that is one. The members are extracted either way --
+    what is lost is only the knowledge that they are enum members, and with it
+    the data bullet, since that section lists no plain classes.
+
+    The shape this defends is not exotic. Python forbids subclassing an enum
+    that has members, so a memberless base holding shared methods is the only
+    way to share behaviour across enums, and any codebase that wants to hits
+    exactly this. On the map that found it the two halves cancelled out: the
+    memberless base rendered as `SeriesType — enum:` with nothing after it,
+    the subclass carrying the members rendered as nothing at all, and the enum
+    the reader wanted was named five times in `{ReportType: str}` bullets and
+    defined nowhere.
+
+    Enum only, deliberately. Subclassing an enum makes you an enum; subclassing
+    a dataclass does not make you a dataclass unless you carry the decorator
+    too, so a general rule here would be wrong for three of the four kinds.
+
+    Same module only. A base imported from elsewhere needs the import table,
+    which `extract_module` does not have -- it runs per file, before any
+    project-wide view exists.
+    """
+    kinds = {cls.name: cls.kind for cls in classes}
+    # To a fixed point rather than in source order. Python requires a base to
+    # be defined above its subclass, so one forward pass would do, but a
+    # two-level hierarchy is the whole point here and depending on the ordering
+    # to carry it is a subtlety the next reader should not have to reconstruct.
+    changed = True
+    while changed:
+        changed = False
+        for cls in classes:
+            if cls.kind != 'class':
+                continue
+            if any(kinds.get(b.split('.')[-1]) == 'enum' for b in cls.bases):
+                cls.kind = 'enum'
+                kinds[cls.name] = 'enum'
+                changed = True
 
 
 def _is_main_guard(node: ast.If) -> bool:
