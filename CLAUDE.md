@@ -278,6 +278,20 @@ result:
 | whole function, two questions  | 61%  | 77% | +16  |
 | rendered map, two questions    | 94%  | 95% | +1   |
 
+A fifth configuration turned reasoning on, because all four above had `think:
+false` copied from `notes._ask`, where it exists because reasoning shares
+`num_predict` with the answer and at 40 tokens consumes it. That is a
+truncation problem rather than a verdict on reasoning, so the four rows tested
+a model with its reasoning off and did not say so.
+
+Turned on, it splits by question. Naming never converges — 28473 characters of
+reasoning at an 8000-token ceiling, `done_reason` still `length`, answer still
+empty. The closed KEEP-or-DROP question stops on its own in three to ten
+seconds, so reasoning was given to that half alone, which was the failing half.
+It widened the gap rather than closing it, from +16 to +33, with 18% of asks
+unreadable. That side is 14 verdicts and so is suggestive rather than decisive,
+but it points the same way as everything else.
+
 The right column is ground truth inverted — those are runs an author thought
 worth a heading, so a gate that judges should decline them *less*. The decline
 rate climbs with context and with a plainer invitation to refuse, and the gap
