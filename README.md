@@ -1,9 +1,11 @@
 # recce
 
 A reconnaissance pass over unfamiliar Python. Point it at a file, a package, or
-a directory of scripts and it prints a one-screen map: the entry points, who
-calls whom, which calls leave the project, and the one to three functions worth
-reading first.
+a directory of scripts and it prints a map: the entry points, who calls whom,
+which calls leave the project, and where to start reading.
+
+A single file is one screen. A package is a screen-sized block per file, led —
+where the project declares how it is run — by the one flow that crosses them.
 
 It is a scripted stand-in for the `code-map` skill, for code that cannot be
 sent to a hosted model.
@@ -58,8 +60,10 @@ recce pkg/ --json                         # the intermediate state, not the map
 recce pkg/ --draft                        # a map to save and annotate, not read once
 recce pkg/ --max-source-chars 20000       # ask about long functions too, given the memory
 recce pkg/ --type app                     # draw the flow across modules; lib, test also
-
+recce pkg/ --no-llm                       # never call a model, whatever the environment says
 ```
+
+`--help` has the rest.
 
 `--out` will not write over a file that already exists. That is a small
 rudeness when the map is disposable and the only thing standing between you
@@ -85,9 +89,9 @@ Both are still ordinary flags and either one given explicitly still wins, so
 `--draft --max-lines 60` means 60.
 
 The number is measured rather than chosen, and it took two codebases to settle.
-Notes are the first thing the budget gives up, so a tight one starves them: on
-`requests`, 40 requested notes rendered 5 at the default, 21 at 80, and all 40
-at 120, with 200 giving a byte-identical map. On `rich` — 100 modules to
+Notes are among the first things the budget gives up, so a tight one starves
+them: on `requests`, 40 requested notes rendered 5 at the default, 21 at 80,
+and all 40 at 120, with 200 giving a byte-identical map. On `rich` — 100 modules to
 `requests`' 19 — 120 renders 23 of 40 and 200 renders all 40. Where the budget
 stops binding is a property of the tree being mapped, so the default has to
 clear the larger case, and clearing it costs the smaller one nothing.
@@ -179,7 +183,7 @@ guessed one is read first, believed, and unfalsifiable from the map alone.
 
 ## How it works
 
-Four passes, each reading only what the one before it wrote:
+Five passes, each reading only what the one before it wrote:
 
 | Pass | Module | Does |
 |---|---|---|
@@ -190,8 +194,9 @@ Four passes, each reading only what the one before it wrote:
 | render | `render.py` | format as markdown |
 
 `rank.py` is where the arguing is worth doing. It decides what counts as a
-trivial helper, what earns a star, and when a map splits, and those three
-choices are most of what separates this from a graph dump.
+trivial helper, which row a block is read from and which one carries its
+weight, and when a map splits — and those choices are most of what separates
+this from a graph dump.
 
 Speed is not the point but it is worth knowing the shape, since it decides
 whether you can point this at something on a whim:
@@ -382,6 +387,13 @@ of the call graph. The first of those is a declaration and the rest are
 inference, which is why it wins — though a console script that is a two-line
 shim is followed rather than starred.
 
+Where it falls back on graph shape, it ranks by what a candidate leads to
+rather than by what it contains. "Nothing calls it" cannot tell an entry point
+from an unused helper, and on library code the difference is stark: ranked by
+their own branchiness, `requests` offers `help.main` and six uncalled `utils`
+helpers before `api.get`. Ranked by reach, `Session.get` comes first, leading
+to 37 functions across 7 modules.
+
 ## Tests
 
 ```sh
@@ -399,3 +411,12 @@ passed the whole suite on the floor.
 the three fixtures shipped with the `code-map` skill and asserts that skill's
 own verification checklist, item by item. Those tests skip when the skill is
 not checked out on this machine.
+
+Neither of those tells you whether a change made the maps better, which is a
+different question and the one that matters. `./corpus /tmp/before`, make the
+change, `./corpus /tmp/after`, and diff: eighteen real codebases in about
+twenty seconds. A green suite has repeatedly proved nothing here — every bug
+worth finding needed a codebase big enough to run out of room, because
+choosing what to leave out is the whole product and a small fixture never has
+to choose. `CLAUDE.md` has the rest, including why the output is in two
+directories that must be read differently.
